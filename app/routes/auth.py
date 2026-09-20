@@ -15,7 +15,7 @@ from ..core.security import (
     hash_password,
     verify_password,
 )
-from ..db import get_db
+from ..db import commit_now, get_db
 from ..models import User, new_id
 from ..schemas import RefreshIn, RegisterIn, TokenPair, UserOut
 
@@ -71,6 +71,7 @@ def register(body: RegisterIn, db: Session = Depends(get_db)) -> TokenPair:
     )
     db.add(user)
     db.flush()
+    commit_now(db)
     return _token_pair(user)
 
 

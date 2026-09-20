@@ -57,7 +57,14 @@ def get_session_factory() -> sessionmaker[Session]:
 
 
 def get_db() -> Iterator[Session]:
-    """FastAPI dependency yielding a request-scoped session."""
+    """FastAPI dependency yielding a request-scoped session.
+
+    The commit happens BEFORE the response is returned: since
+    FastAPI 0.106, teardown of yield-dependencies runs after the
+    response has been sent, so committing in teardown would let a
+    client that fires a follow-up request immediately (register ->
+    login) read against the pre-commit snapshot and fail.
+    """
     factory = get_session_factory()
     db = factory()
     try:
@@ -68,6 +75,13 @@ def get_db() -> Iterator[Session]:
         raise
     finally:
         db.close()
+
+
+def commit_now(db: Session) -> None:
+    """Commit immediately for mutating routes, so the write is durable
+    before the response is sent (see get_db docstring). Idempotent: a
+    later commit of a clean session is a no-op."""
+    db.commit()
 
 
 def reset_engine_for_tests(db_url: str) -> Engine:

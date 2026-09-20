@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..controller.manager import Controller, get_controller
-from ..db import get_db
+from ..db import commit_now, get_db
 from ..models import Conversation, Run, User, new_id
 from ..routes.auth import authenticate_user
 from ..schemas import (
@@ -55,6 +55,7 @@ def create_conversation(
     conversation = Conversation(id=new_id("cnv"), user_id=user.id, title=body.title)
     db.add(conversation)
     db.flush()
+    commit_now(db)
     return ConversationOut(
         id=conversation.id,
         title=conversation.title,
@@ -103,6 +104,7 @@ def delete_conversation(
 ) -> None:
     conversation = _own_conversation(db, user, conversation_id)
     db.delete(conversation)
+    commit_now(db)
 
 
 @router.post("/{conversation_id}/runs", response_model=RunOut, status_code=status.HTTP_202_ACCEPTED)

@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core import secrets_store
-from ..db import get_db
+from ..db import commit_now, get_db
 from ..models import Secret, User, new_id
 from ..routes.auth import authenticate_user
 from ..schemas import SecretIn, SecretOut
@@ -33,6 +33,7 @@ def put_secret(
     if existing is not None:
         existing.value_encrypted = secrets_store.encrypt(body.value)
         db.flush()
+        commit_now(db)
         return SecretOut(name=name, created_at=existing.created_at)
     secret = Secret(
         id=new_id("sec"),
@@ -42,6 +43,7 @@ def put_secret(
     )
     db.add(secret)
     db.flush()
+    commit_now(db)
     return SecretOut(name=name, created_at=secret.created_at)
 
 
@@ -63,3 +65,4 @@ def delete_secret(
     if secret is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "secret not found")
     db.delete(secret)
+    commit_now(db)
