@@ -131,7 +131,7 @@ class TestExecRun:
 
 class TestCancel:
     def test_cancel_delivered_to_live_process(self, tmp_path) -> None:
-        """SIGINT reaches the harness; the process actually exits."""
+        """SIGINT reaches the harness once it is up; the process exits."""
         script = tmp_path / "sigint_harness.py"
         script.write_text(
             textwrap.dedent(
@@ -147,23 +147,25 @@ class TestCancel:
         runner = LocalRunner()
         runner._harness.cmd = f"{sys.executable} {script}"
         sandbox = runner.create("u", "c")
-        started = threading.Event()
         result_box: dict = {}
 
         def _run() -> None:
-            started.set()  # wait until child prints "ready" instead
-            result = runner.exec_run(sandbox, "p", "r", timeout=15)
+            result = runner.exec_run(sandbox, "p", "r", on_line=_on_line, timeout=15)
             result_box["result"] = result
 
-        # start exec on a thread, cancel once the child is up
+        def _on_line(line: str) -> None:
+            # The child's own SIGINT handler is installed before it prints
+            # "ready", so cancelling here cannot race interpreter startup
+            # (an early SIGINT would kill the raw interpreter with a
+            # KeyboardInterrupt traceback instead of exit code 130).
+            if line == "ready":
+                result_box["cancel_ok"] = runner.cancel(sandbox, "r")
+
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        deadline = time.time() + 10
-        while time.time() < deadline and "r" not in runner._live_procs:
-            time.sleep(0.02)
-        assert runner.cancel(sandbox, "r") is True
         thread.join(timeout=15)
         result = result_box["result"]
+        assert result_box.get("cancel_ok") is True
         assert result.exit_code == 130
         assert "cancelled" in result.stdout
 
