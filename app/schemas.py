@@ -4,14 +4,28 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- auth ---
 
 
 class RegisterIn(BaseModel):
-    email: EmailStr
+    # Deliberately a plain validated string, not EmailStr: email-validator
+    # rejects single-label domains ("user@localhost", common in dev) and
+    # reserved names outright, which made login/register 422 in practice.
+    email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def _normalize_email(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v.count("@") != 1 or not v.split("@")[0]:
+            raise ValueError("must contain exactly one @ with a local part")
+        local, domain = v.split("@")
+        if not domain or " " in v or any(c in v for c in "\"'<>,;:\\"):
+            raise ValueError("invalid email address")
+        return v
 
 
 class TokenPair(BaseModel):

@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     )
 
     db_url: str = "sqlite:///./paw.db"
-    secret_key: str = "dev-only-insecure-key-change-me"
+    secret_key: str = "dev-only-insecure-key-change-me-0123456789abcdef"
     fernet_key: str = ""
     """Fernet key for the secrets store; empty = derived from
     ``secret_key`` (dev convenience, stable across restarts)."""

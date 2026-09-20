@@ -79,6 +79,12 @@ function add(kind, text) {
   msgs.appendChild(div); msgs.scrollTop = msgs.scrollHeight; return div;
 }
 
+function errMsg(res) {
+  return res.json().then(j => {
+    const d = j.detail ?? j;
+    return Array.isArray(d) ? d.map(e => `${(e.loc||[]).slice(1).join('.')}: ${e.msg}`).join('; ') : String(d);
+  }).catch(() => res.statusText || 'request failed');
+}
 $('loginBtn').onclick = async () => {
   const email = $('email').value.trim(), password = $('password').value;
   let res = await fetch('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -87,7 +93,7 @@ $('loginBtn').onclick = async () => {
     res = await fetch('/auth/register', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({email, password})});
   }
-  if (!res.ok) { $('authMsg').textContent = 'auth failed: ' + (await res.json()).detail; return; }
+  if (!res.ok) { $('authMsg').textContent = 'auth failed: ' + await errMsg(res); return; }
   const tokens = await res.json();
   api.token = tokens.access_token; sessionStorage.setItem('token', api.token); showApp();
 };
@@ -152,7 +158,7 @@ async function send() {
   }
   const res = await api.req(`/conversations/${currentConv}/runs`,
     {method:'POST', body: JSON.stringify({prompt})});
-  if (!res.ok) { add('err', (await res.json()).detail); return; }
+  if (!res.ok) { add('err', await errMsg(res)); return; }
   const run = await res.json();
   startStream(run.id);
 }
