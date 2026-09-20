@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>python-agent-web</title>
+<style>
+  :root { --bg:#0f1115; --fg:#e6e6e6; --accent:#4f8cff; --muted:#8b93a1; }
+  body { margin:0; font:14px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 20px; border-bottom:1px solid #23262e; display:flex; gap:16px; align-items:center; }
+  header h1 { font-size:15px; margin:0; color:var(--accent); }
+  header input { background:#181b21; color:var(--fg); border:1px solid #2a2e37; padding:6px 10px; border-radius:6px; }
+  main { display:flex; height:calc(100vh - 54px); }
+  #sidebar { width:230px; border-right:1px solid #23262e; overflow:auto; padding:8px; }
+  #sidebar .cnv { padding:8px 10px; border-radius:6px; cursor:pointer; color:var(--muted); }
+  #sidebar .cnv.active { background:#1d2129; color:var(--fg); }
+  #chat { flex:1; display:flex; flex-direction:column; }
+  #messages { flex:1; overflow:auto; padding:20px 28px; }
+  .msg { margin:10px 0; white-space:pre-wrap; }
+  .msg.user { color:var(--accent); }
+  .msg.tool { color:var(--muted); font-family:ui-monospace, monospace; font-size:12px; }
+  .msg.err { color:#ff6b6b; }
+  #composer { display:flex; gap:8px; padding:14px 20px; border-top:1px solid #23262e; }
+  #prompt { flex:1; background:#181b21; color:var(--fg); border:1px solid #2a2e37; padding:10px 12px; border-radius:8px; }
+  button { background:var(--accent); border:0; color:#fff; padding:9px 18px; border-radius:8px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #auth { max-width:360px; margin:15vh auto; display:flex; flex-direction:column; gap:10px; }
+  #auth input { background:#181b21; color:var(--fg); border:1px solid #2a2e37; padding:10px; border-radius:8px; }
+</style>
+</head>
+<body>
+<div id="auth">
+  <h2>python-agent-web</h2>
+  <input id="email" placeholder="email">
+  <input id="password" type="password" placeholder="password">
+  <button id="loginBtn">Sign in / Register</button>
+  <div id="authMsg" style="color:var(--muted)"></div>
+</div>
+<div id="app" style="display:none">
+  <header>
+    <h1>python-agent-web</h1>
+    <input id="title" placeholder="conversation title" style="width:240px">
+    <span id="usage" style="color:var(--muted);margin-left:auto"></span>
+  </header>
+  <main>
+    <div id="sidebar"></div>
+    <div id="chat">
+      <div id="messages"></div>
+      <div id="composer">
+        <input id="prompt" placeholder="ask the agent… (Enter to send)">
+        <button id="sendBtn">Send</button>
+        <button id="cancelBtn" disabled>Stop</button>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+const api = {
+  token: sessionStorage.getItem('token') || '',
+  async req(path, opts={}) {
+    const res = await fetch(path, {...opts, headers: {
+      'Content-Type': 'application/json',
+      ...(this.token ? {Authorization: 'Bearer ' + this.token} : {}),
+      ...(opts.headers||{})}});
+    if (res.status === 401) { showAuth('session expired'); throw new Error('unauthorized'); }
+    return res;
+  }
+};
+const $ = id => document.getElementById(id);
+const msgs = $('messages');
+let currentConv = null, currentRun = null, es = null;
+
+function showAuth(msg) { $('app').style.display='none'; $('auth').style.display='flex';
+  $('authMsg').textContent = msg || ''; sessionStorage.removeItem('token'); api.token=''; }
+function showApp() { $('auth').style.display='none'; $('app').style.display='block'; loadConversations(); loadUsage(); }
+
+function add(kind, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind; div.textContent = text;
+  msgs.appendChild(div); msgs.scrollTop = msgs.scrollHeight; return div;
+}
+
+$('loginBtn').onclick = async () => {
+  const email = $('email').value.trim(), password = $('password').value;
+  let res = await fetch('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({email, password})});
+  if (res.status === 401 || res.status === 403) {
+    res = await fetch('/auth/register', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email, password})});
+  }
+  if (!res.ok) { $('authMsg').textContent = 'auth failed: ' + (await res.json()).detail; return; }
+  const tokens = await res.json();
+  api.token = tokens.access_token; sessionStorage.setItem('token', api.token); showApp();
+};
+$('password').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
+
+async function loadConversations() {
+  const res = await api.req('/conversations');
+  const list = await res.json();
+  $('sidebar').innerHTML = '';
+  for (const c of list) {
+    const div = document.createElement('div');
+    div.className = 'cnv' + (c.id === currentConv ? ' active' : '');
+    div.textContent = c.title;
+    div.onclick = () => openConversation(c.id, c.title);
+    $('sidebar').appendChild(div);
+  }
+}
+async function loadUsage() {
+  const res = await api.req('/usage/summary');
+  const u = await res.json();
+  $('usage').textContent = `${u.input_tokens} in / ${u.output_tokens} out / ${u.rounds} rounds`;
+}
+
+async function openConversation(id, title) {
+  currentConv = id; $('title').value = title; msgs.innerHTML = '';
+  const res = await api.req('/conversations/' + id);
+  const detail = await res.json();
+  for (const run of detail.runs) {
+    add('user', run.prompt);
+    if (run.answer) add('', run.answer);
+    if (run.error) add('err', run.error);
+  }
+  loadConversations();
+}
+$('title').addEventListener('change', async () => { /* rename: PUT when supported */ });
+
+function startStream(runId) {
+  currentRun = runId; $('cancelBtn').disabled = false;
+  const url = `/conversations/${currentConv}/runs/${runId}/stream?access_token=${encodeURIComponent(api.token)}`;
+  es = new EventSource(url);
+  es.onmessage = ev => {
+    const e = JSON.parse(ev.data);
+    if (e.type === 'delta') { /* deltas collapse into the final answer */ }
+    else if (e.type === 'notify' && e.data && e.data.kind === 'tool_start')
+      add('tool', '· tools: ' + (e.data.data || []).join(', '));
+    else if (e.type === 'notify' && e.data && e.data.kind === 'error')
+      add('err', e.data.data);
+    else if (e.type === 'run') {
+      es.close(); es = null; currentRun = null; $('cancelBtn').disabled = true;
+      openConversation(currentConv, $('title').value); loadUsage();
+    }
+  };
+  es.onerror = () => { /* retry handled by refreshing on run end */ };
+}
+
+async function send() {
+  const prompt = $('prompt').value.trim(); if (!prompt) return;
+  $('prompt').value = ''; add('user', prompt);
+  if (!currentConv) {
+    const res = await api.req('/conversations', {method:'POST', body: JSON.stringify({title: prompt.slice(0, 60)})});
+    const c = await res.json(); currentConv = c.id;
+  }
+  const res = await api.req(`/conversations/${currentConv}/runs`,
+    {method:'POST', body: JSON.stringify({prompt})});
+  if (!res.ok) { add('err', (await res.json()).detail); return; }
+  const run = await res.json();
+  startStream(run.id);
+}
+$('sendBtn').onclick = send;
+$('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+$('cancelBtn').onclick = async () => {
+  if (!currentRun) return;
+  await api.req(`/conversations/${currentConv}/runs/${currentRun}/cancel`, {method:'POST'});
+};
+
+if (api.token) showApp();
+</script>
+</body>
+</html>
