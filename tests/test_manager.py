@@ -192,12 +192,15 @@ class TestStartRun:
         controller = _controller(StubRunner(delay=0.5, stdout=RESULT_OK))
         db = get_session_factory()()
         try:
-            controller.start_run(db, user_id=uid, conversation_id=cid, prompt="one")
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="one")
             with pytest.raises(RuntimeError, match="already has a running run"):
                 controller.start_run(db, user_id=uid, conversation_id=cid, prompt="two")
         finally:
             db.close()
-        _wait_status(controller, "nonexistent", set())  # no-op safety
+        # run #1's worker is still sleeping (delay=0.5s); let it finalize
+        # before the next test resets the DB engine (a late finalize would
+        # query the fresh engine: "no such table: runs")
+        _wait_status(controller, run.id, {"done"})
 
 
 def _wait_status(controller: Controller, run_id: str, states: set[str]) -> None:
@@ -329,6 +332,9 @@ def test_thread_safety_of_subscribe(user_id) -> None:
     assert all(q is not None for q in queues)
     for q in queues:  # type: ignore[union-attr]
         assert q.get(timeout=5)  # each gets at least one event
+    # the worker still sleeps 0.2s; let it finalize before the next test
+    # resets the DB engine
+    _wait_status(controller, run_id, {"done"})
 
 
 def test_queue_disconnect_mid_run(user_id) -> None:

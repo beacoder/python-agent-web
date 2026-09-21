@@ -18,6 +18,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -127,6 +128,9 @@ class ServerRunner(Runner):
             "workspace": self._harness.cwd or os.getcwd(),
             "created_ts": time.time(),
             "last_used": time.time(),
+            # per-process stderr tail (bounded); drained by one thread
+            # per process — see _ensure_err_drain
+            "stderr_log": deque(maxlen=200),
         }
         with self._lock:
             self._sandboxes[sandbox_id] = meta
@@ -144,7 +148,33 @@ class ServerRunner(Runner):
                 self._locks[sandbox_id] = threading.Lock()
                 self._live_run[sandbox_id] = None
                 self._exec_locks[sandbox_id] = threading.Lock()
+        if proc is not None:
+            self._ensure_err_drain(meta, proc)
         return sandbox_id
+
+    def _ensure_err_drain(self, meta: dict[str, Any], proc: subprocess.Popen) -> None:
+        """One stderr drainer per PROCESS, not per exec.
+
+        A resident process never EOFs its stderr between turns, so a
+        per-exec readline thread would leak one blocked thread per turn
+        (LocalRunner could join its pumps because the process died;
+        here the process lives on).  The drainer appends to a bounded
+        buffer on the sandbox meta and dies with the process.
+        """
+        assert proc.stderr is not None
+        if meta.get("_err_drain_for") == id(proc):
+            return
+        meta["_err_drain_for"] = id(proc)
+
+        def _drain() -> None:
+            assert proc.stderr is not None
+            try:
+                for chunk in iter(proc.stderr.readline, ""):
+                    meta["stderr_log"].append(chunk)
+            except (ValueError, OSError):
+                pass  # stream closed at teardown
+
+        threading.Thread(target=_drain, daemon=True, name="serve-stderr").start()
 
     def destroy(self, sandbox_id: str) -> None:
         with self._lock:
@@ -240,7 +270,7 @@ class ServerRunner(Runner):
 
     # -- run execution ------------------------------------------------------
 
-    def _read_ready(self, proc: subprocess.Popen, timeout: float = 10.0) -> bool:
+    def _read_ready(self, proc: subprocess.Popen, timeout: float = 30.0) -> bool:
         """Consume the resident process's ``ready`` line.
 
         Called right after spawn (before the first submit): the ready
@@ -323,6 +353,8 @@ class ServerRunner(Runner):
                 proc = self._spawn(sandbox_id, meta)
             except OSError as exc:
                 return ExecResult(exit_code=None, stdout="", stderr=f"exec failed: {exc}")
+            meta["stderr_log"].clear()
+            self._ensure_err_drain(meta, proc)
             if not self._read_ready(proc):
                 return ExecResult(
                     exit_code=None, stdout="", stderr="harness process died before ready"
@@ -338,6 +370,9 @@ class ServerRunner(Runner):
                 )
             meta["ready_ok"] = True
         self.touch(sandbox_id)
+        # stderr diagnostics: snapshot position in the per-process
+        # drainer's buffer, so this exec only reports ITS OWN stderr
+        err_from = len(meta["stderr_log"])
         with self._lock:
             self._live_run[sandbox_id] = run_id
         try:
@@ -347,20 +382,20 @@ class ServerRunner(Runner):
                 return ExecResult(
                     exit_code=None, stdout="", stderr="harness process died before submit"
                 )
-            stdout_lines, stderr_chunks, timed_out = self._pump_until_result(
+            stdout_lines, timed_out, saw_result = self._pump_until_result(
                 proc,
                 on_line,
                 timeout,
                 cancel_op=lambda: self._send(proc, lock, {"op": "cancel", "run_id": run_id}),
             )
-            saw_result = any('"type": "result"' in line for line in stdout_lines)
             if not saw_result and not timed_out:
                 # EOF without a result line: the process died mid-run
                 # (write success was a race with exit).  Surface death.
                 return ExecResult(
                     exit_code=proc.poll(),
                     stdout="".join(stdout_lines),
-                    stderr="".join(stderr_chunks) or "harness process died mid-run",
+                    stderr="".join(list(meta["stderr_log"])[err_from:])
+                    or "harness process died mid-run",
                 )
         finally:
             with self._lock:
@@ -368,7 +403,7 @@ class ServerRunner(Runner):
         return ExecResult(
             exit_code=0 if not timed_out else None,
             stdout="".join(stdout_lines),
-            stderr="".join(stderr_chunks),
+            stderr="".join(list(meta["stderr_log"])[err_from:]),
             timed_out=timed_out,
         )
 
@@ -378,13 +413,18 @@ class ServerRunner(Runner):
         on_line: Any,
         timeout: float | None,
         cancel_op: Any = None,
-    ) -> tuple[list[str], list[str], bool]:
+    ) -> tuple[list[str], bool, bool]:
         """Read stdout lines until the run's ``result`` line (or death).
 
         The resident process stays alive after the result (next turn
         reuses it), so we cannot wait() — the run's terminal marker is
-        its result line.  ``stderr`` is drained on a background thread
-        for diagnostics.
+        its result line.  Returns ``(stdout_lines, timed_out, saw_result)``;
+        ``saw_result`` comes from parsing, never substring matching (a
+        raw line echoing result-JSON must not count).
+
+        stderr is drained per process (see ``_ensure_err_drain``), not
+        here: the resident process outlives the exec, so a per-exec
+        reader would block forever and leak one thread per turn.
 
         The deadline is enforced by a watchdog: readline blocks with no
         data, so polling the clock around it could never recover.  The
@@ -393,16 +433,8 @@ class ServerRunner(Runner):
         ignores it.
         """
         stdout_lines: list[str] = []
-        stderr_chunks: list[str] = []
-        assert proc.stdout is not None and proc.stderr is not None
-
-        def _drain_err() -> None:
-            assert proc.stderr is not None
-            for chunk in iter(proc.stderr.readline, ""):
-                stderr_chunks.append(chunk)
-
-        err_thread = threading.Thread(target=_drain_err, daemon=True)
-        err_thread.start()
+        saw_result = False
+        assert proc.stdout is not None
         done = threading.Event()  # result line seen
         timed_out = threading.Event()  # watchdog fired
 
@@ -443,9 +475,10 @@ class ServerRunner(Runner):
             except ValueError:
                 continue
             if isinstance(payload, dict) and payload.get("type") == "result":
+                saw_result = True
                 done.set()
                 break
-        return stdout_lines, stderr_chunks, timed_out.is_set()
+        return stdout_lines, timed_out.is_set(), saw_result
 
 
 def get_runner() -> Runner:

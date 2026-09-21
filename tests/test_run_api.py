@@ -126,6 +126,19 @@ class TestRunRoutes:
                 headers=headers,
             )
             assert second.status_code == 409
+            # run #1's worker is still sleeping; let it finish before the
+            # next test resets the DB engine (a late finalize would query
+            # the fresh engine: "no such table: runs")
+            first_run_id = first.json()["id"]
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                poll = client.get(
+                    f"/conversations/{conversation_id}/runs/{first_run_id}",
+                    headers=headers,
+                )
+                if poll.json()["status"] != "running":
+                    break
+                time.sleep(0.02)
         finally:
             mgr._controller = real
 
@@ -464,6 +477,16 @@ class TestRunRoutes:
                 f"/conversations/{conversation_id}/runs/{run_id}", headers=headers
             ).json()
             assert row["cancelled"] is True
+            # the cancelled worker still sleeps ~1.5s; let it finalize
+            # before the next test resets the DB engine
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                poll = client.get(
+                    f"/conversations/{conversation_id}/runs/{run_id}", headers=headers
+                )
+                if poll.json()["status"] != "running":
+                    break
+                time.sleep(0.02)
         finally:
             mgr._controller = real
 
@@ -578,6 +601,17 @@ class TestAnswerRun:
             assert res.status_code == 200
             assert res.json() == {"delivered": True}
             assert runner.answers == [(run_id, ["blue", "red"])]
+            # let the worker finish before the fixture resets the DB
+            # engine for the next test — a late finalize would query the
+            # fresh engine (flaky "no such table: runs" in its thread)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                poll = client.get(
+                    f"/conversations/{conversation_id}/runs/{run_id}", headers=headers
+                )
+                if poll.json()["status"] != "running":
+                    break
+                time.sleep(0.02)
         finally:
             from app.controller import manager as mgr
 
@@ -591,3 +625,48 @@ class TestAnswerRun:
             headers=headers,
         )
         assert res.status_code == 422
+
+
+class TestRunTimeoutForwarding:
+    """The manager must forward the configured harness timeout into
+    exec_run — without it a wedged harness never times out."""
+
+    def test_configured_timeout_reaches_exec_run(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.controller import manager as mgr
+
+        seen: list[float | None] = []
+
+        class TimeoutRunner(ScriptedRunner):
+            def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
+                seen.append(timeout)
+                return super().exec_run(
+                    sandbox_id, prompt, run_id, on_line=on_line, timeout=timeout
+                )
+
+        settings = mgr.get_settings().model_copy(deep=True)
+        settings.harness.timeout = 12.5
+        monkeypatch.setattr(mgr, "get_settings", lambda: settings)
+        real = mgr._controller
+        mgr._controller = mgr.Controller(runner=TimeoutRunner())
+        try:
+            headers, conversation_id = _setup(client)
+            run_id = client.post(
+                f"/conversations/{conversation_id}/runs",
+                json={"prompt": "x"},
+                headers=headers,
+            ).json()["id"]
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                poll = client.get(
+                    f"/conversations/{conversation_id}/runs/{run_id}",
+                    headers=headers,
+                )
+                if poll.json()["status"] != "running":
+                    break
+                time.sleep(0.02)
+            assert seen == [12.5]
+            assert poll.json()["status"] == "done"
+        finally:
+            mgr._controller = real

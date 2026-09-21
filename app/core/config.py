@@ -28,9 +28,8 @@ class HarnessSettings(BaseSettings):
     default and left to config inside the sandbox image."""
 
     max_rounds: int | None = None
-    """Reserved: per-run round budget is configured inside the sandbox
-    image (harness config ``headless.max_rounds``); not sent over the
-    serve protocol today."""
+    """Reserved: not sent over the serve protocol today (serve runs
+    have no harness-side round budget)."""
 
 
 class SandboxSettings(BaseSettings):

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -360,7 +361,7 @@ class TestBranchCompletions:
 class TestReviewFixes:
     """Regressions for the code-review findings."""
 
-    def test_startup_hang_is_killed_by_ready_watchdog(self, tmp_path) -> None:
+    def test_startup_hang_is_killed_by_ready_watchdog(self, tmp_path, monkeypatch) -> None:
         """A harness that never prints ready cannot hang the handshake:
         the watchdog kills it and exec reports died-before-ready."""
         script = tmp_path / "hang_startup.py"
@@ -370,12 +371,19 @@ class TestReviewFixes:
         sandbox = runner.create("u", "c")
         runner._procs[sandbox].kill()  # force the respawn path
         runner._procs[sandbox].wait(timeout=5)
+        # the production default (30s, cold-start headroom) is too slow
+        # for the suite; exercise the same watchdog with a short deadline
+        monkeypatch.setattr(
+            runner,
+            "_read_ready",
+            lambda proc: ServerRunner._read_ready(runner, proc, timeout=2),
+        )
         started = time.time()
         result = runner.exec_run(sandbox, "hi", "run_1", timeout=10)
         elapsed = time.time() - started
         assert result.exit_code is None
         assert "died before ready" in result.stderr
-        assert elapsed < 11  # watchdog fired at ~10s, no indefinite block
+        assert elapsed < 11  # watchdog fired, no indefinite block
         runner.destroy(sandbox)
 
     def test_error_line_surfaces_in_run_outcome(self) -> None:
@@ -457,5 +465,90 @@ class TestReviewFixes:
             # watchdog did NOT escalate to kill (process survived)
             assert runner._procs[sandbox].poll() is None
             assert '"cancelled": true' in result.stdout
+        finally:
+            runner.destroy(sandbox)
+
+    def test_result_substring_in_raw_line_does_not_mask_death(self, tmp_path) -> None:
+        """saw_result must come from parsing: a raw (non-JSON) line
+        echoing the marker text must not be taken as the run's result
+        and mask a process death."""
+        script = tmp_path / "echoes_result_marker.py"
+        script.write_text(
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'type': 'ready', 'pid': 1}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.stdin.readline()  # consume the submit op\n"
+            'sys.stdout.write(\'echo: "type": "result" is the marker\\n\')\n'
+            "sys.stdout.flush()\n"
+            "sys.exit(7)\n"
+        )
+        runner = ServerRunner()
+        runner._harness.cmd = f"{sys.executable} {script}"
+        sandbox = runner.create("u", "c")
+        try:
+            result = runner.exec_run(sandbox, "hi", "run_1", timeout=10)
+            assert result.exit_code == 7  # death surfaced, not masked
+            assert "died mid-run" in result.stderr
+        finally:
+            runner.destroy(sandbox)
+
+    def test_stderr_is_captured_and_sliced_per_turn(self, tmp_path) -> None:
+        """stderr diagnostics: one per-process drainer feeds a bounded
+        buffer; each exec reports only its own slice, and the resident
+        process staying alive does not lose the tail."""
+        script = tmp_path / "noisy_serve.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import json, sys, time
+                def out(p):
+                    sys.stdout.write(json.dumps(p) + "\\n"); sys.stdout.flush()
+                out({"type": "ready", "pid": 1})
+                while True:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    op = json.loads(line)
+                    if op.get("op") == "submit":
+                        sys.stderr.write("warn:" + op["prompt"] + "\\n")
+                        sys.stderr.flush()
+                        time.sleep(0.3)  # let the drainer capture it
+                        out({"seq": 1, "type": "result", "run_id": op["run_id"],
+                             "answer": "ok", "errors": [], "cancelled": False})
+                """
+            )
+        )
+        runner = ServerRunner()
+        runner._harness.cmd = f"{sys.executable} {script}"
+        sandbox = runner.create("u", "c")
+        try:
+            first = runner.exec_run(sandbox, "one", "run_1", timeout=10)
+            second = runner.exec_run(sandbox, "two", "run_2", timeout=10)
+            assert "warn:one" in first.stderr
+            assert "warn:two" in second.stderr
+            assert "warn:one" not in second.stderr  # sliced per exec
+        finally:
+            runner.destroy(sandbox)
+
+    def test_stderr_drainer_never_leaks_per_turn(self, runner: ServerRunner) -> None:
+        """One drainer thread per resident process, not per exec: a
+        per-exec readline thread would block forever (the resident
+        process never EOFs its stderr between turns) and leak one
+        thread per turn."""
+
+        def drainers() -> list[threading.Thread]:
+            return [t for t in threading.enumerate() if t.name == "serve-stderr"]
+
+        sandbox = runner.create("u", "c")
+        try:
+            # drainers of processes destroyed by earlier tests exit on
+            # EOF; give stragglers a moment so the count is meaningful
+            deadline = time.time() + 5
+            while time.time() < deadline and len(drainers()) != 1:
+                time.sleep(0.02)
+            assert len(drainers()) == 1  # one resident process -> one drainer
+            for i in range(3):
+                runner.exec_run(sandbox, f"turn {i}", f"run_{i}", timeout=30)
+            assert len(drainers()) == 1  # still one after three more turns
         finally:
             runner.destroy(sandbox)

@@ -111,6 +111,9 @@ class Controller:
                     prompt,
                     run_id,
                     on_line=lambda line: self._on_line(run_id, line),
+                    # watchdog: without it a wedged harness (or a
+                    # forever-pending ask) keeps the run "running" forever
+                    timeout=get_settings().harness.timeout,
                 )
             except SandboxNotFoundError as exc:
                 self._finish_run(run_id, RunOutcome(errors=[f"sandbox gone: {exc}"], duration_ms=0))
