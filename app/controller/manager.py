@@ -133,10 +133,10 @@ class Controller:
         return run
 
     def cancel_run(self, run_id: str) -> bool:
-        """Best-effort graceful cancel: signal the harness process via
-        the runner (SIGINT path; tools get their salvage window) and
-        mark the intent on the run row.  The run's own exit (result
-        line with ``cancelled: true``, or error) finalizes the row."""
+        """Best-effort graceful cancel: send the protocol cancel op to
+        the resident harness process and mark the intent on the run
+        row.  The run's own exit (result line with ``cancelled: true``,
+        or error) finalizes the row."""
         with self._lock:
             active = self._active.get(run_id)
         if active is None:
@@ -149,6 +149,22 @@ class Controller:
                 run.cancelled = True
                 db.commit()
         return True
+
+    def deliver_answer(self, run_id: str, answers: list[str]) -> bool:
+        """Forward a user's answer to a pending mid-run question.
+
+        Returns False when the run is not live (unknown/finished); the
+        route maps that to 409.  The runner forwards the answer as an
+        ``op:answer`` protocol message to the resident harness process.
+        """
+        with self._lock:
+            active = self._active.get(run_id)
+        if active is None:
+            return False
+        delivered = getattr(self._runner, "deliver_answer", None)
+        if delivered is None:
+            return False
+        return bool(delivered(active.sandbox_id, run_id, answers))
 
     # -- internals ---------------------------------------------------------
 

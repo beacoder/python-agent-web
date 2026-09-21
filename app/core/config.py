@@ -18,18 +18,19 @@ class HarnessSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PAW_HARNESS__")
 
     cmd: str = "python-agent-harness"
-    """Harness binary to run (must support ``headless --json``)."""
+    """Harness binary to run (must support ``serve``)."""
 
     cwd: str = ""
     """Agent workspace directory; empty = the server process's cwd."""
 
     timeout: float | None = None
-    """Wall-clock budget passed to the harness (``--timeout``); off by
+    """Host-side wall-clock budget for one run (result line); off by
     default and left to config inside the sandbox image."""
 
     max_rounds: int | None = None
-    """Round budget passed to the harness (``--max-rounds``); off by
-    default and left to config inside the sandbox image."""
+    """Reserved: per-run round budget is configured inside the sandbox
+    image (harness config ``headless.max_rounds``); not sent over the
+    serve protocol today."""
 
 
 class SandboxSettings(BaseSettings):
@@ -56,8 +57,10 @@ class Settings(BaseSettings):
     access_token_minutes: float = 30.0
     refresh_token_days: float = 14.0
 
-    runner: str = "local"
-    """``local`` (subprocess on this host) for now; docker later."""
+    runner: str = "server"
+    """Sandbox runner: ``server`` (one resident ``harness serve``
+    process per sandbox: multi-turn memory, mid-run Q&A, protocol-level
+    cancel).  Docker later."""
     harness: HarnessSettings = HarnessSettings()
     sandbox: SandboxSettings = SandboxSettings()
 

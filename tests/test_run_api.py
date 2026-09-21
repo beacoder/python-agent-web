@@ -466,3 +466,128 @@ class TestRunRoutes:
             assert row["cancelled"] is True
         finally:
             mgr._controller = real
+
+
+class TestAnswerRun:
+    """POST .../answer: forwards the reply to a pending mid-run question."""
+
+    def _swap_controller(self, runner):
+        from app.controller import manager as mgr
+
+        real = mgr._controller
+        mgr._controller = mgr.Controller(runner=runner)
+        return real
+
+    def test_answer_unknown_run_is_404(self, client: TestClient) -> None:
+        headers, conversation_id = _setup(client)
+        res = client.post(
+            f"/conversations/{conversation_id}/runs/run_missing/answer",
+            json={"answers": ["x"]},
+            headers=headers,
+        )
+        assert res.status_code == 404
+
+    def test_answer_requires_auth(self, client: TestClient) -> None:
+        res = client.post("/conversations/cnv_x/runs/run_x/answer", json={"answers": ["x"]})
+        assert res.status_code == 401
+
+    def test_answer_not_live_is_409(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A finished run no longer accepts answers (409).
+
+        Swaps in a scripted runner WITHOUT ``deliver_answer``: once the
+        run leaves the active set, the route must reject with 409."""
+        from app.controller import manager as mgr
+
+        real = mgr._controller
+        mgr._controller = mgr.Controller(runner=ScriptedRunner())
+        try:
+            headers, conversation_id = _setup(client)
+            run_id = client.post(
+                f"/conversations/{conversation_id}/runs",
+                json={"prompt": "x"},
+                headers=headers,
+            ).json()["id"]
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                poll = client.get(
+                    f"/conversations/{conversation_id}/runs/{run_id}", headers=headers
+                )
+                if poll.json()["status"] != "running":
+                    break
+                time.sleep(0.02)
+            res = client.post(
+                f"/conversations/{conversation_id}/runs/{run_id}/answer",
+                json={"answers": ["blue"]},
+                headers=headers,
+            )
+            assert res.status_code == 409
+        finally:
+            mgr._controller = real
+
+    def test_answer_delivered_on_live_run(self, client: TestClient) -> None:
+        import json as _json
+
+        from app.controller.runner import ExecResult, Runner
+
+        class AnsweringRunner(Runner):
+            """Resident-style runner: accepts answers while running."""
+
+            def __init__(self) -> None:
+                self.answers: list[tuple[str, list[str]]] = []
+
+            def create(self, user_id, conversation_id):
+                return "sbx_0"
+
+            def destroy(self, sandbox_id):
+                pass
+
+            def cancel(self, sandbox_id, run_id):
+                return True
+
+            def deliver_answer(self, sandbox_id, run_id, answers):
+                self.answers.append((run_id, answers))
+                return True
+
+            def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
+                time.sleep(0.5)
+                return ExecResult(
+                    exit_code=0,
+                    stdout=_json.dumps({"type": "result", "answer": "x", "errors": []}) + "\n",
+                    stderr="",
+                )
+
+            def reap_idle(self, ttl_seconds):
+                return []
+
+        runner = AnsweringRunner()
+        real = self._swap_controller(runner)
+        try:
+            headers, conversation_id = _setup(client)
+            run_id = client.post(
+                f"/conversations/{conversation_id}/runs",
+                json={"prompt": "x"},
+                headers=headers,
+            ).json()["id"]
+            res = client.post(
+                f"/conversations/{conversation_id}/runs/{run_id}/answer",
+                json={"answers": ["blue", "red"]},
+                headers=headers,
+            )
+            assert res.status_code == 200
+            assert res.json() == {"delivered": True}
+            assert runner.answers == [(run_id, ["blue", "red"])]
+        finally:
+            from app.controller import manager as mgr
+
+            mgr._controller = real
+
+    def test_answer_requires_nonempty_answers(self, client: TestClient) -> None:
+        headers, conversation_id = _setup(client)
+        res = client.post(
+            f"/conversations/{conversation_id}/runs/run_x/answer",
+            json={"answers": []},
+            headers=headers,
+        )
+        assert res.status_code == 422

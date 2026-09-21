@@ -123,14 +123,14 @@ class Secret(Base):
 class Sandbox(Base):
     """Sandbox registry: one row per live (or recently live) sandbox.
 
-    ``runner_id`` names the backend that owns it (``local`` today);
+    ``runner_id`` names the backend that owns it (``server`` today);
     ``last_used_at`` drives the idle reaper.
     """
 
     __tablename__ = "sandboxes"
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    runner_id: Mapped[str] = mapped_column(String(32), default="local")
+    runner_id: Mapped[str] = mapped_column(String(32), default="server")
     user_id: Mapped[str] = mapped_column(String(40), index=True)
     conversation_id: Mapped[str] = mapped_column(String(40), default="")
     spec: Mapped[dict] = mapped_column(JSON, default=dict)

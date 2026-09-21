@@ -17,6 +17,7 @@ from ..schemas import (
     ConversationCreate,
     ConversationDetail,
     ConversationOut,
+    RunAnswer,
     RunCreate,
     RunOut,
 )
@@ -152,6 +153,33 @@ def cancel_run(
     if run is None or run.conversation_id != conversation.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
     return {"cancelled": controller.cancel_run(run_id)}
+
+
+@router.post("/{conversation_id}/runs/{run_id}/answer")
+def answer_run(
+    conversation_id: str,
+    run_id: str,
+    body: RunAnswer,
+    user: User = Depends(authenticate_user),
+    db: Session = Depends(get_db),
+    controller: Controller = Depends(get_controller),
+) -> dict:
+    """Answer a pending mid-run question.
+
+    The harness's ask event (notify kind ``ask`` on the SSE stream)
+    carries the questions; the user's reply is forwarded verbatim to
+    the blocked agent.  409 when the run is not live.
+    """
+    conversation = _own_conversation(db, user, conversation_id)
+    run = db.get(Run, run_id)
+    if run is None or run.conversation_id != conversation.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+    if not controller.deliver_answer(run_id, body.answers):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "run is not accepting answers (finished, or runner lacks mid-run Q&A)",
+        )
+    return {"delivered": True}
 
 
 @router.get("/{conversation_id}/runs/{run_id}/stream")

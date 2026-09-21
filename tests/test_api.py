@@ -68,7 +68,7 @@ class TestAuthFlow:
 
 class TestHealth:
     def test_healthz(self, client: TestClient) -> None:
-        assert client.get("/healthz").json() == {"ok": True, "runner": "local"}
+        assert client.get("/healthz").json() == {"ok": True, "runner": "server"}
 
 
 class TestConversations:

@@ -1,11 +1,12 @@
-"""Protocol types and parsing for the harness ``headless --json`` stream.
+"""Protocol types and parsing for the harness event stream.
 
-The harness emits one JSON object per line on stdout
-(``start``/``delta``/``notify``/``log``/``result``, each carrying
-``seq`` and ``run_id``; ``result`` carries ``answer``, ``errors``,
-``usage``, ``model``, ``cancelled``).  This module turns raw output
-into typed events — the *only* coupling point with the harness repo,
-and purely a data contract.
+The harness emits one JSON object per line on stdout (``start``/
+``delta``/``notify``/``log``/``result``, each carrying ``seq`` and
+``run_id``; ``result`` carries ``answer``, ``errors``, ``usage``,
+``model``, ``cancelled``) — the same line shapes on both the one-shot
+``headless --json`` pipe and the resident ``serve`` protocol.  This
+module turns raw lines into typed events — the *only* coupling point
+with the harness repo, and purely a data contract.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-LINE_TYPES = {"start", "delta", "notify", "log", "result"}
+LINE_TYPES = {"start", "delta", "notify", "log", "result", "error"}
 
 
 @dataclass
@@ -87,13 +88,25 @@ def apply_event(outcome: RunOutcome, event: ProtocolEvent) -> None:
         outcome.answer = str(event.data.get("answer", ""))
         errors = event.data.get("errors")
         if isinstance(errors, list):
-            outcome.errors = [str(e) for e in errors]
+            # the result line is canonical for its own errors, but must
+            # not wipe protocol errors folded from earlier lines (e.g.
+            # a rejected mid-run answer): merge, preserving order
+            for e in (str(e) for e in errors):
+                if e not in outcome.errors:
+                    outcome.errors.append(e)
         usage = event.data.get("usage")
         outcome.usage = dict(usage) if isinstance(usage, dict) else None
         outcome.model = event.data.get("model")
         outcome.cancelled = bool(event.data.get("cancelled", False))
     elif event.type == "notify" and event.data.get("kind") == "error":
         message = event.data.get("data")
+        if message is not None and str(message) not in outcome.errors:
+            outcome.errors.append(str(message))
+    elif event.type == "error":
+        # harness protocol-level failure (unknown op, stale answer, a
+        # cancel racing the run's finish): keep it in the run's error
+        # trail so it surfaces instead of vanishing
+        message = event.data.get("error")
         if message is not None and str(message) not in outcome.errors:
             outcome.errors.append(str(message))
 

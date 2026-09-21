@@ -71,6 +71,12 @@ class RunCreate(BaseModel):
     prompt: str = Field(min_length=1)
 
 
+class RunAnswer(BaseModel):
+    """A user's reply to a pending mid-run question (resident mode)."""
+
+    answers: list[str] = Field(min_length=1)
+
+
 class RunOut(BaseModel):
     id: str
     status: str

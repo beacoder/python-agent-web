@@ -1,18 +1,19 @@
 """Sandbox runners: where the (untrusted) harness process executes.
 
 ``Runner`` is the sandbox-manager contract: create a sandbox, exec a
-run inside it, destroy it.  ``LocalRunner`` implements the contract
-with plain subprocesses on this host — fine for dev and single-user;
-``DockerRunner`` (later) will implement the same interface against
-container images so the trust boundary becomes real isolation.
+run inside it, destroy it.  ``ServerRunner`` implements the contract
+with one resident ``python-agent-harness serve`` process per sandbox,
+spoken to over the bidirectional JSONL protocol; ``DockerRunner``
+(later) will implement the same interface against container images so
+the trust boundary becomes real isolation.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shlex
-import signal
 import subprocess
 import threading
 import time
@@ -65,34 +66,109 @@ class Runner:
         raise NotImplementedError
 
 
-class LocalRunner(Runner):
-    """Subprocess-per-exec on the local host, one workspace dir per
-    sandbox.  No real isolation — the trusted/untrusted boundary is a
-    process boundary only; swap in DockerRunner for production."""
+class ServerRunner(Runner):
+    """Resident runner: one long-lived ``harness serve`` process per
+    sandbox, spoken to over the bidirectional JSONL protocol.
+
+    The resident process keeps conversation history between turns
+    (multi-turn memory), avoids the per-turn interpreter spawn, and can
+    receive mid-run answers (``deliver_answer``) and cancels as
+    protocol messages instead of signals.  The trust boundary is
+    unchanged: the harness still runs as its own (containerizable)
+    process.
+
+    ``exec_run`` submits the prompt, streams stdout JSON lines through
+    *on_line*, and returns when the harness's ``result`` line arrives
+    (the process stays alive for the next turn).  A host-side timeout
+    falls back to killing the process, which surfaces as a failed run.
+    """
 
     def __init__(self, harness: HarnessSettings | None = None) -> None:
         self._harness = harness or get_settings().harness
         self._sandboxes: dict[str, dict[str, Any]] = {}
-        self._live_procs: dict[str, subprocess.Popen] = {}
+        self._procs: dict[str, subprocess.Popen] = {}  # sandbox_id -> proc
+        self._locks: dict[str, threading.Lock] = {}  # sandbox_id -> write lock
+        self._live_run: dict[str, str | None] = {}  # sandbox_id -> active run_id
         self._lock = threading.Lock()
+        # One exec per sandbox at a time: the live-run check in
+        # exec_run is check-then-act, so concurrent execs on the SAME
+        # sandbox (two turns racing) could both pass it and double-spawn.
+        self._exec_locks: dict[str, threading.Lock] = {}
 
     # -- sandbox lifecycle ------------------------------------------------
 
+    def _command(self) -> list[str]:
+        cmd = shlex.split(self._harness.cmd)
+        cmd += ["serve"]
+        return cmd
+
+    def _spawn(self, sandbox_id: str, meta: dict[str, Any]) -> subprocess.Popen:
+        env = dict(os.environ)
+        env.setdefault("PAW_NONINTERACTIVE", "1")
+        proc = subprocess.Popen(  # noqa: S603 - cmd is admin-configured
+            self._command(),
+            cwd=meta.get("workspace") or None,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=(os.name == "posix"),
+        )
+        return proc
+
     def create(self, user_id: str, conversation_id: str) -> str:
         sandbox_id = f"sbx_{uuid.uuid4().hex}"
+        meta = {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "workspace": self._harness.cwd or os.getcwd(),
+            "created_ts": time.time(),
+            "last_used": time.time(),
+        }
         with self._lock:
-            self._sandboxes[sandbox_id] = {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "workspace": self._harness.cwd or os.getcwd(),
-                "created_ts": time.time(),
-                "last_used": time.time(),
-            }
+            self._sandboxes[sandbox_id] = meta
+        # spawn eagerly so the first exec does not pay the interpreter
+        # startup latency; a failed spawn is tolerated here and retried
+        # (surfacing its OSError) at exec time.  The ready line is left
+        # in the pipe for the first exec's handshake.
+        try:
+            proc = self._spawn(sandbox_id, meta)
+        except OSError:
+            proc = None  # type: ignore[assignment]
+        with self._lock:
+            if proc is not None:
+                self._procs[sandbox_id] = proc
+                self._locks[sandbox_id] = threading.Lock()
+                self._live_run[sandbox_id] = None
+                self._exec_locks[sandbox_id] = threading.Lock()
         return sandbox_id
 
     def destroy(self, sandbox_id: str) -> None:
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
+            proc = self._procs.pop(sandbox_id, None)
+            self._locks.pop(sandbox_id, None)
+            self._live_run.pop(sandbox_id, None)
+            self._exec_locks.pop(sandbox_id, None)
+        if proc is not None:
+            # graceful first (stdin close ends serve_forever), then kill
+            with contextlib.suppress(ValueError, OSError):
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is None:  # pragma: no cover - Popen with PIPE
+                    continue
+                with contextlib.suppress(ValueError, OSError):
+                    stream.close()
 
     def exists(self, sandbox_id: str) -> bool:
         with self._lock:
@@ -104,27 +180,33 @@ class LocalRunner(Runner):
                 self._sandboxes[sandbox_id]["last_used"] = time.time()
 
     def cancel(self, sandbox_id: str, run_id: str) -> bool:
-        """Signal the harness process group: SIGINT on POSIX (the
-        harness's documented graceful-cancel path, giving tools a
-        salvage window); CTRL_BREAK_EVENT on win32."""
+        """Protocol-level cancel: an ``op:cancel`` line to the resident
+        process (no signals).  False when the run is not live here."""
         with self._lock:
-            proc = self._live_procs.get(run_id)
-            meta = self._sandboxes.get(sandbox_id)
-        if proc is None or meta is None or proc.poll() is not None:
+            proc = self._procs.get(sandbox_id)
+            live = self._live_run.get(sandbox_id)
+            lock = self._locks.get(sandbox_id)
+        if proc is None or live != run_id or proc.poll() is not None:
             return False
         self.touch(sandbox_id)
-        try:
-            if os.name == "posix":
-                pgid = os.getpgid(proc.pid)
-                if pgid == proc.pid:
-                    os.killpg(pgid, signal.SIGINT)
-                else:
-                    proc.send_signal(signal.SIGINT)
-            else:  # win32: CTRL_BREAK to the shared console group
-                proc.send_signal(signal.CTRL_BREAK_EVENT)
-        except (ProcessLookupError, OSError):
-            return False  # process just exited; the pump will finish the run
-        return True
+        return self._send(proc, lock, {"op": "cancel", "run_id": run_id})
+
+    def deliver_answer(self, sandbox_id: str, run_id: str, answers: list[str]) -> bool:
+        """Deliver the user's answer to a pending mid-run question.
+
+        False when the run is not live in this sandbox (the caller maps
+        that to 409/404); a protocol-level "no pending question" is
+        still a delivery attempt — the harness answers with an error
+        line, which the event stream relays.
+        """
+        with self._lock:
+            proc = self._procs.get(sandbox_id)
+            live = self._live_run.get(sandbox_id)
+            lock = self._locks.get(sandbox_id)
+        if proc is None or live != run_id or proc.poll() is not None:
+            return False
+        self.touch(sandbox_id)
+        return self._send(proc, lock, {"op": "answer", "run_id": run_id, "answers": answers})
 
     def reap_idle(self, ttl_seconds: float) -> list[str]:
         now = time.time()
@@ -132,20 +214,66 @@ class LocalRunner(Runner):
         with self._lock:
             for sandbox_id, meta in list(self._sandboxes.items()):
                 if now - float(meta.get("last_used", 0.0)) > ttl_seconds:
-                    self._sandboxes.pop(sandbox_id, None)
                     destroyed.append(sandbox_id)
+        for sandbox_id in destroyed:
+            self.destroy(sandbox_id)
         return destroyed
 
-    # -- run execution ----------------------------------------------------
+    # -- process I/O --------------------------------------------------------
 
-    def _command(self, prompt: str, run_id: str) -> list[str]:
-        cmd = shlex.split(self._harness.cmd)
-        cmd += ["headless", prompt, "--json", "--run-id", run_id]
-        if self._harness.max_rounds is not None:
-            cmd += ["--max-rounds", str(self._harness.max_rounds)]
-        if self._harness.timeout is not None:
-            cmd += ["--timeout", str(self._harness.timeout)]
-        return cmd
+    def _send(self, proc: subprocess.Popen, lock: threading.Lock | None, op: dict) -> bool:
+        """Write one op line to the resident process (serialized).
+
+        False when the process is already dead (write raises) — the
+        caller reports the failure instead of waiting forever.
+        """
+        if lock is None:
+            lock = threading.Lock()
+        try:
+            with lock:
+                assert proc.stdin is not None
+                proc.stdin.write(json.dumps(op) + "\n")
+                proc.stdin.flush()
+        except (ValueError, OSError):
+            return False
+        return True
+
+    # -- run execution ------------------------------------------------------
+
+    def _read_ready(self, proc: subprocess.Popen, timeout: float = 10.0) -> bool:
+        """Consume the resident process's ``ready`` line.
+
+        Called right after spawn (before the first submit): the ready
+        handshake guarantees the interpreter + harness imported cleanly
+        before the first op is sent.
+
+        A watchdog kills the process when the deadline passes: readline
+        blocks with no data, so only closing the pipe (via kill) can
+        unblock a startup hang (bad config, missing module, ...).
+        """
+        assert proc.stdout is not None
+        ready = threading.Event()
+
+        def _kill_on_deadline() -> None:
+            if not ready.wait(timeout):
+                with contextlib.suppress(OSError):
+                    proc.kill()
+
+        watchdog = threading.Thread(target=_kill_on_deadline, daemon=True)
+        watchdog.start()
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:  # EOF: died before ready
+                    return False
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("type") == "ready":
+                    return True
+        finally:
+            ready.set()  # retire the watchdog either way
 
     def exec_run(
         self,
@@ -157,77 +285,171 @@ class LocalRunner(Runner):
     ) -> ExecResult:
         with self._lock:
             meta = self._sandboxes.get(sandbox_id)
-        if meta is None:
+            proc = self._procs.get(sandbox_id)
+            lock = self._locks.get(sandbox_id)
+            live_slot = self._live_run.get(sandbox_id)
+            exec_lock = self._exec_locks.get(sandbox_id)
+        if meta is None or exec_lock is None:
+            # exec_lock is missing only when create()'s spawn also
+            # failed; both mean the sandbox cannot take ops
             raise SandboxNotFoundError(sandbox_id)
-        self.touch(sandbox_id)
-        env = dict(os.environ)
-        env.setdefault("PAW_NONINTERACTIVE", "1")
-        try:
-            proc = subprocess.Popen(  # noqa: S603 - cmd is admin-configured
-                self._command(prompt, run_id),
-                cwd=meta.get("workspace") or None,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                start_new_session=(os.name == "posix"),
+        # Serialize the whole exec (live-check, respawn, submit, pump)
+        # per sandbox: the live-run check alone is check-then-act and
+        # racy under concurrent execs on the same sandbox.
+        with exec_lock:
+            return self._exec_run_locked(
+                sandbox_id, prompt, run_id, on_line, timeout, meta, proc, lock, live_slot
             )
-        except OSError as exc:
-            return ExecResult(exit_code=None, stdout="", stderr=f"exec failed: {exc}")
+
+    def _exec_run_locked(
+        self,
+        sandbox_id: str,
+        prompt: str,
+        run_id: str,
+        on_line: Any,
+        timeout: float | None,
+        meta: dict[str, Any],
+        proc: subprocess.Popen | None,
+        lock: threading.Lock | None,
+        live_slot: str | None,
+    ) -> ExecResult:
+        if live_slot is not None:
+            raise RuntimeError(f"sandbox {sandbox_id} already has a live run")
+        # respawn a crashed/never-started process; a fresh process must
+        # pass the ready handshake before it can take ops.  A process
+        # spawned eagerly at create() still has its ready line pending.
+        if proc is None or proc.poll() is not None:
+            try:
+                proc = self._spawn(sandbox_id, meta)
+            except OSError as exc:
+                return ExecResult(exit_code=None, stdout="", stderr=f"exec failed: {exc}")
+            if not self._read_ready(proc):
+                return ExecResult(
+                    exit_code=None, stdout="", stderr="harness process died before ready"
+                )
+            with self._lock:
+                self._procs[sandbox_id] = proc
+                self._locks[sandbox_id] = threading.Lock()
+                lock = self._locks[sandbox_id]
+        elif not meta.get("ready_ok"):
+            if not self._read_ready(proc):
+                return ExecResult(
+                    exit_code=None, stdout="", stderr="harness process died before ready"
+                )
+            meta["ready_ok"] = True
+        self.touch(sandbox_id)
         with self._lock:
-            self._live_procs[run_id] = proc
-
-        stdout_lines: list[str] = []
-        stderr_chunks: list[str] = []
-        timed_out = threading.Event()
-        assert proc.stdout is not None and proc.stderr is not None
-
-        def _pump(stream: Any, sink: list, callback: Any) -> None:
-            # Reads until EOF (or the process is killed, which closes the
-            # pipe); runs on a thread so the caller can enforce the timeout.
-            for chunk in iter(stream.readline, ""):
-                sink.append(chunk)
-                if callback is not None:
-                    # a slow/broken subscriber must not kill the run
-                    with contextlib.suppress(Exception):
-                        callback(chunk.rstrip("\n"))
-
-        stdout_thread = threading.Thread(
-            target=_pump, args=(proc.stdout, stdout_lines, on_line), daemon=True
-        )
-        stderr_thread = threading.Thread(
-            target=_pump, args=(proc.stderr, stderr_chunks, None), daemon=True
-        )
-        stdout_thread.start()
-        stderr_thread.start()
+            self._live_run[sandbox_id] = run_id
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out.set()
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=5)
+            if proc.poll() is not None or not self._send(
+                proc, lock, {"op": "submit", "prompt": prompt, "run_id": run_id}
+            ):
+                return ExecResult(
+                    exit_code=None, stdout="", stderr="harness process died before submit"
+                )
+            stdout_lines, stderr_chunks, timed_out = self._pump_until_result(
+                proc,
+                on_line,
+                timeout,
+                cancel_op=lambda: self._send(proc, lock, {"op": "cancel", "run_id": run_id}),
+            )
+            saw_result = any('"type": "result"' in line for line in stdout_lines)
+            if not saw_result and not timed_out:
+                # EOF without a result line: the process died mid-run
+                # (write success was a race with exit).  Surface death.
+                return ExecResult(
+                    exit_code=proc.poll(),
+                    stdout="".join(stdout_lines),
+                    stderr="".join(stderr_chunks) or "harness process died mid-run",
+                )
         finally:
             with self._lock:
-                self._live_procs.pop(run_id, None)
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        for stream in (proc.stdout, proc.stderr):
-            # a reader thread may still hold it briefly on Windows
-            with contextlib.suppress(ValueError, OSError):
-                stream.close()
+                self._live_run[sandbox_id] = None
         return ExecResult(
-            exit_code=proc.returncode,
+            exit_code=0 if not timed_out else None,
             stdout="".join(stdout_lines),
             stderr="".join(stderr_chunks),
-            timed_out=timed_out.is_set(),
+            timed_out=timed_out,
         )
+
+    def _pump_until_result(
+        self,
+        proc: subprocess.Popen,
+        on_line: Any,
+        timeout: float | None,
+        cancel_op: Any = None,
+    ) -> tuple[list[str], list[str], bool]:
+        """Read stdout lines until the run's ``result`` line (or death).
+
+        The resident process stays alive after the result (next turn
+        reuses it), so we cannot wait() — the run's terminal marker is
+        its result line.  ``stderr`` is drained on a background thread
+        for diagnostics.
+
+        The deadline is enforced by a watchdog: readline blocks with no
+        data, so polling the clock around it could never recover.  The
+        watchdog first sends the protocol cancel (graceful: the run
+        unwinds, history is retained) and kills only if the process
+        ignores it.
+        """
+        stdout_lines: list[str] = []
+        stderr_chunks: list[str] = []
+        assert proc.stdout is not None and proc.stderr is not None
+
+        def _drain_err() -> None:
+            assert proc.stderr is not None
+            for chunk in iter(proc.stderr.readline, ""):
+                stderr_chunks.append(chunk)
+
+        err_thread = threading.Thread(target=_drain_err, daemon=True)
+        err_thread.start()
+        done = threading.Event()  # result line seen
+        timed_out = threading.Event()  # watchdog fired
+
+        if timeout is not None:
+
+            def _kill_on_deadline() -> None:
+                if not done.wait(timeout):
+                    timed_out.set()
+                    # graceful first: the protocol cancel lets the
+                    # resident process unwind its run (tools salvage,
+                    # history retained for the next turn).  Kill only
+                    # if it ignores the cancel.
+                    if cancel_op is not None:
+                        cancel_op()
+                        try:
+                            proc.wait(timeout=10)
+                            return  # exited gracefully
+                        except subprocess.TimeoutExpired:
+                            pass  # ignored the cancel: escalate
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+
+            watchdog = threading.Thread(target=_kill_on_deadline, daemon=True)
+            watchdog.start()
+
+        while True:
+            line = proc.stdout.readline()
+            if not line:  # EOF: process died (crash, kill, or timeout)
+                break
+            line = line.rstrip("\n")
+            stdout_lines.append(line + "\n")
+            if on_line is not None:
+                # a slow/broken subscriber must not kill the run
+                with contextlib.suppress(Exception):
+                    on_line(line)
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(payload, dict) and payload.get("type") == "result":
+                done.set()
+                break
+        return stdout_lines, stderr_chunks, timed_out.is_set()
 
 
 def get_runner() -> Runner:
     settings = get_settings()
-    if settings.runner == "local":
-        return LocalRunner()
+    if settings.runner == "server":
+        return ServerRunner()
     raise ValueError(f"unknown runner: {settings.runner!r} (docker runner pending)")

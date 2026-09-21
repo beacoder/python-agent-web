@@ -18,7 +18,7 @@ def _isolated_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     tmp = tempfile.mkdtemp(prefix="paw-test-")
     monkeypatch.setenv("PAW_DB_URL", f"sqlite:///{tmp}/test.db")
     monkeypatch.setenv("PAW_SECRET_KEY", "test-secret-key-not-for-prod-0123456789abcdef")
-    monkeypatch.setenv("PAW_HARNESS__CMD", "true")
+    monkeypatch.setenv("PAW_RUNNER", "server")
     get_settings.cache_clear()
     db_mod._engine = None
     db_mod._session_factory = None
