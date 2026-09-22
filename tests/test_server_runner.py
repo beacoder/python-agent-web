@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from app.controller.runner import SandboxNotFoundError, ServerRunner
+from app.controllers.runner import SandboxNotFoundError, ServerRunner
 
 # A minimal, protocol-faithful fake of `harness serve`: handles submit
 # (echoes an answer result), answer (acks via a log event), cancel
@@ -280,8 +280,8 @@ class TestRunnerEdgePaths:
         runner.destroy(sandbox)
 
     def test_unknown_runner_setting(self, monkeypatch) -> None:
-        from app.controller import runner as runner_mod
-        from app.core.config import Settings
+        from app.controllers import runner as runner_mod
+        from app.infra.config import Settings
 
         monkeypatch.setattr(runner_mod, "get_settings", lambda: Settings(runner="bogus"))
         with pytest.raises(ValueError, match="unknown runner"):
@@ -389,7 +389,7 @@ class TestReviewFixes:
     def test_error_line_surfaces_in_run_outcome(self) -> None:
         """A protocol error line is a first-class event, folded into the
         run's error trail (not a malformed pseudo-log)."""
-        from app.controller.protocol import parse_line, parse_stream
+        from app.controllers.protocol import parse_line, parse_stream
 
         event = parse_line('{"type": "error", "error": "run x is not active"}')
         assert event is not None
@@ -397,7 +397,7 @@ class TestReviewFixes:
         assert not event.malformed
         outcome_text = '{"type": "result", "answer": "a", "errors": []}\n'
         text = outcome_text + '{"type": "error", "error": "stale answer"}\n'
-        from app.controller.protocol import RunOutcome, apply_event
+        from app.controllers.protocol import RunOutcome, apply_event
 
         outcome = RunOutcome()
         for e in parse_stream(text):
@@ -407,7 +407,7 @@ class TestReviewFixes:
     def test_result_errors_merge_not_replace(self) -> None:
         """The result line's own errors must not wipe protocol errors
         folded from earlier lines (stale-answer scenario)."""
-        from app.controller.protocol import RunOutcome, apply_event, parse_stream
+        from app.controllers.protocol import RunOutcome, apply_event, parse_stream
 
         text = (
             '{"type": "error", "error": "stale answer"}\n'
