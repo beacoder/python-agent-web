@@ -8,5 +8,6 @@ htmlcov/
 *.db
 *.db-shm
 *.db-wal
+workspaces/
 .env
 .venv/
