@@ -15,56 +15,87 @@ stay decoupled (the harness only needs to be on PATH of whatever runs
 the agent).
 
 ```
-Coding Space Server
-        │
- ┌──────▼─────────┐
- │ Agent Controller│   app.controller
- └──────┬─────────┘
-        │ resident subprocess: python-agent-harness serve (JSONL over pipes)
- ┌──────▼─────────┐
- │    Sandbox      │   app.controller.runner (ServerRunner now, Docker later)
- │  agent process  │
- │  tools, bash, … │
- └─────────────────┘
-
-TRUSTED                    UNTRUSTED / ISOLATED
-─────────────              ─────────────────────
-FastAPI app                harness agent process
-Controller                 agent-generated commands
-Auth (JWT)                 repository, builds
-Billing (usage ledger)
-Secrets (Fernet)
-Runner (sandbox manager contract; ServerRunner today, Docker later)
+┌──────────────────────────────────────────────────────────────────────┐
+│ Browser (views/index.html)                                           │
+│   chat UI · file upload · task cards · SSE event stream              │
+└───────────────┬──────────────────────────────────────▲───────────────┘
+                │ REST (JSON, Bearer JWT)              │ SSE (text/event-stream)
+                │ POST /conversations/{id}/files       │ GET  /conversations/{id}/runs/{rid}/stream
+                │ POST /conversations/{id}/runs        │ start/delta/notify/log/result
+                │ GET  /conversations/{id}/artifacts   │
+┌───────────────▼──────────────────────────────────────┴───────────────┐
+│ FastAPI app  (TRUSTED)                                               │
+│                                                                      │
+│  routes/        auth · conversations(+files, runs, artifacts)        │
+│                 billing · secrets                                    │
+│  controllers/   manager.py  run lifecycle, event fan-out (subscribe) │
+│                 protocol.py JSONL line parsing                       │
+│                 runner.py   ServerRunner: one resident harness       │
+│                             process per conversation                 │
+│  infra/         config (PAW_* env) · security (JWT, Fernet)          │
+│  models/        SQLite (SQLAlchemy): users, conversations, runs,     │
+│                 files, usage ledger, secrets, sandboxes              │
+└───────────────┬──────────────────────────────────────────────────────┘
+                │ stdin/stdout pipes — bidirectional JSONL
+                │ host→agent: {"op": submit|answer|cancel|ping|shutdown}
+                │ agent→host: ready / start / delta / notify / log / result
+                │
+┌───────────────▼──────────────────────────────────────────────────────┐
+│ python-agent-harness serve  (UNTRUSTED, black box — never imported)  │
+│   cwd = workspaces/<conversation_id>/                                │
+│   tools, bash, pandas/openpyxl …                                     │
+└───────────────┬──────────────────────────────────────────────────────┘
+                │ reads uploads / writes outputs
+┌───────────────▼──────────────────────────────────────────────────────┐
+│ workspaces/<conversation_id>/                                        │
+│   a1b2c3d4_sales.xlsx   ← user upload (hex-prefixed)                 │
+│   final.xlsx            ← agent output (downloadable via /artifacts) │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+Protocol split: **JSONL** is the backend↔harness link (pipes);
+**SSE** is the browser↔backend link.  The controller is a protocol
+translator — each parsed JSONL line is fanned out to in-memory
+subscribers and re-emitted as an SSE `data:` frame, so the browser
+sees the same events the harness TUI renders (tool progress, todos,
+errors, mid-run questions).
 
 ## Layout
 
 ```
 app/
   main.py          FastAPI app factory + routers + static UI
-  core/
-    config.py      Settings (pydantic-settings, env prefix PAW_)
-    security.py    JWT auth (access/refresh) + password hashing
-  db.py            SQLite engine/session (SQLAlchemy ORM)
-  models.py        User, Conversation, Run, UsageEvent, Secret
-  schemas.py       Pydantic request/response models
-  routes/
+  models/          (model layer)
+    __init__.py    ORM models: User, Conversation, ConversationFile, Run,
+                   UsageEvent, Secret, Sandbox
+    db.py          SQLite engine/session (SQLAlchemy ORM)
+  validation/      (request/response validation)
+    schemas.py     Pydantic request/response models
+  routes/          (view layer, HTTP)
     auth.py        POST /auth/register /auth/login /auth/refresh /auth/me
-    conversations.py  CRUD + POST /{id}/files (upload) + POST /{id}/runs (start)
-                      + POST /{id}/answer + GET /{id}/stream (SSE)
+    conversations.py  CRUD + POST /{id}/files (upload) + GET/DELETE
+                      /{id}/artifacts (agent outputs) + POST /{id}/runs
+                      (start) + POST /{id}/answer + GET /{id}/stream (SSE)
     billing.py     usage summary (token ledger)
     secrets.py     CRUD (write-only read: value never returned)
-  controller/
+  controllers/     (business logic)
     protocol.py    Parse harness event lines (seq/run_id/result/usage)
     manager.py     Controller: start_run, event pump, subscribe, cancel, answer
-    runner.py      Runner protocol + ServerRunner (resident serve process)
-  static/index.html  Minimal chat UI (EventSource -> runs, fetch -> API)
+    runner.py      Runner protocol + ServerRunner (resident serve process,
+                   per-conversation workspace cwd)
+  views/           (static UI)
+    index.html     Chat UI: upload, task cards, SSE progress (tool status,
+                   todos, ask/answer), artifact downloads
+  infra/           (cross-cutting infrastructure)
+    config.py      Settings (pydantic-settings, env prefix PAW_)
+    security.py    JWT auth (access/refresh) + password hashing
+    secrets_store.py  Fernet-encrypted secret values
 ```
 
 ## Quick start
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
+python -m venv venv && . venv/bin/activate
 pip install -e ".[dev]"
 uvicorn app.main:app --reload    # http://127.0.0.1:8000 (UI at /)
 ```
