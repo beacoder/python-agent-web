@@ -7,8 +7,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from app.controller import manager as manager_mod
-from app.controller.runner import ExecResult, Runner
+from app.controllers import manager as manager_mod
+from app.controllers.runner import ExecResult, Runner
 
 
 class ScriptedRunner(Runner):
@@ -109,7 +109,7 @@ class TestRunRoutes:
                     stderr="",
                 )
 
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         real = mgr._controller
         mgr._controller = mgr.Controller(runner=SlowRunner())
@@ -239,7 +239,7 @@ class TestRunRoutes:
                     time.sleep(0.05)
                 return ExecResult(exit_code=0, stdout=self.stdout, stderr="")
 
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         real = mgr._controller
         mgr._controller = mgr.Controller(runner=SlowRunner())
@@ -269,8 +269,8 @@ class TestRunRoutes:
             mgr._controller = real
 
     def test_runner_crash_marks_error(self, client: TestClient) -> None:
-        from app.controller import manager as mgr
-        from app.controller.runner import SandboxNotFoundError
+        from app.controllers import manager as mgr
+        from app.controllers.runner import SandboxNotFoundError
 
         real = mgr._controller
         mgr._controller = mgr.Controller(
@@ -297,7 +297,7 @@ class TestRunRoutes:
             mgr._controller = real
 
     def test_runner_generic_error_marks_error(self, client: TestClient) -> None:
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         real = mgr._controller
         mgr._controller = mgr.Controller(runner=ScriptedRunner(raise_error=RuntimeError("boom")))
@@ -323,8 +323,8 @@ class TestRunRoutes:
 
     def test_missing_binary_marks_error(self, client: TestClient) -> None:
         """A harness binary that cannot exec produces an error run."""
-        from app.controller import manager as mgr
-        from app.controller.runner import ExecResult
+        from app.controllers import manager as mgr
+        from app.controllers.runner import ExecResult
 
         class DeadRunner(ScriptedRunner):
             def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
@@ -369,7 +369,7 @@ class TestRunRoutes:
                     time.sleep(0.05)
                 return ExecResult(exit_code=0, stdout=self.stdout, stderr="")
 
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         real = mgr._controller
         mgr._controller = mgr.Controller(runner=SlowRunner())
@@ -456,7 +456,7 @@ class TestRunRoutes:
                     stderr="",
                 )
 
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         real = mgr._controller
         mgr._controller = mgr.Controller(runner=SlowRunner())
@@ -495,7 +495,7 @@ class TestAnswerRun:
     """POST .../answer: forwards the reply to a pending mid-run question."""
 
     def _swap_controller(self, runner):
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         real = mgr._controller
         mgr._controller = mgr.Controller(runner=runner)
@@ -521,7 +521,7 @@ class TestAnswerRun:
 
         Swaps in a scripted runner WITHOUT ``deliver_answer``: once the
         run leaves the active set, the route must reject with 409."""
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         real = mgr._controller
         mgr._controller = mgr.Controller(runner=ScriptedRunner())
@@ -552,7 +552,7 @@ class TestAnswerRun:
     def test_answer_delivered_on_live_run(self, client: TestClient) -> None:
         import json as _json
 
-        from app.controller.runner import ExecResult, Runner
+        from app.controllers.runner import ExecResult, Runner
 
         class AnsweringRunner(Runner):
             """Resident-style runner: accepts answers while running."""
@@ -613,7 +613,7 @@ class TestAnswerRun:
                     break
                 time.sleep(0.02)
         finally:
-            from app.controller import manager as mgr
+            from app.controllers import manager as mgr
 
             mgr._controller = real
 
@@ -634,7 +634,7 @@ class TestRunTimeoutForwarding:
     def test_configured_timeout_reaches_exec_run(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from app.controller import manager as mgr
+        from app.controllers import manager as mgr
 
         seen: list[float | None] = []
 
