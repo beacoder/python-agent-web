@@ -11,3 +11,4 @@ htmlcov/
 workspaces/
 .env
 .venv/
+venv/
