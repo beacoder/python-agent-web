@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from app.controller.protocol import RunOutcome, apply_event, parse_line, parse_stream
+from app.controllers.protocol import RunOutcome, apply_event, parse_line, parse_stream
 
 
 class TestParseLine:
