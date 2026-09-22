@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
-from app.db import get_session_factory
 from app.models import Run, new_id
+from app.models.db import get_session_factory
 
 
 def _utcnow() -> datetime:
@@ -188,15 +188,15 @@ class TestSecretsRoutes:
     def test_refresh_token_of_unknown_user_rejected(self, client: TestClient) -> None:
         import jwt as pyjwt
 
-        from app.core.config import get_settings
-        from app.core.security import create_token
+        from app.infra.config import get_settings
+        from app.infra.security import create_token
 
         token = create_token("usr_missing", "refresh", 600)
         assert client.post("/auth/refresh", json={"refresh_token": token}).status_code == 401
         _ = pyjwt, get_settings  # keep imports referenced
 
     def test_access_token_of_unknown_user_rejected(self, client: TestClient) -> None:
-        from app.core.security import create_token
+        from app.infra.security import create_token
 
         token = create_token("usr_missing", "access", 600)
         res = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
@@ -217,9 +217,9 @@ class TestSecretsRoutes:
         ).json()
         import tempfile
 
-        from app.core.config import get_settings
-        from app.db import get_session_factory
+        from app.infra.config import get_settings
         from app.models import User
+        from app.models.db import get_session_factory
 
         db = get_session_factory()()
         try:
@@ -239,9 +239,9 @@ class TestSecretsRoutes:
         _ = get_settings, tempfile
 
     def test_decrypt_roundtrip(self, client: TestClient, auth_headers: dict) -> None:
-        from app.core import secrets_store
-        from app.db import get_session_factory
+        from app.infra import secrets_store
         from app.models import Secret
+        from app.models.db import get_session_factory
 
         client.put("/secrets/KEY", json={"name": "KEY", "value": "plain"}, headers=auth_headers)
         db = get_session_factory()()
@@ -265,8 +265,8 @@ class TestBillingRoutes:
         }
 
     def test_summary_after_run(self, client: TestClient, auth_headers: dict) -> None:
-        from app.db import get_session_factory
         from app.models import Conversation, UsageEvent, new_id
+        from app.models.db import get_session_factory
 
         conversation_id = client.post(
             "/conversations", json={"title": "bill"}, headers=auth_headers
