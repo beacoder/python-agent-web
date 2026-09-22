@@ -22,7 +22,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.config import HarnessSettings, get_settings
+from ..core.config import HarnessSettings, conversation_workspace, get_settings
 
 
 @dataclass
@@ -103,6 +103,9 @@ class ServerRunner(Runner):
         cmd += ["serve"]
         return cmd
 
+    def _workspace_dir(self, conversation_id: str) -> str:
+        return str(conversation_workspace(conversation_id))
+
     def _spawn(self, sandbox_id: str, meta: dict[str, Any]) -> subprocess.Popen:
         env = dict(os.environ)
         env.setdefault("PAW_NONINTERACTIVE", "1")
@@ -125,7 +128,7 @@ class ServerRunner(Runner):
         meta = {
             "user_id": user_id,
             "conversation_id": conversation_id,
-            "workspace": self._harness.cwd or os.getcwd(),
+            "workspace": self._workspace_dir(conversation_id),
             "created_ts": time.time(),
             "last_used": time.time(),
             # per-process stderr tail (bounded); drained by one thread
