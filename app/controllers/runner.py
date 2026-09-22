@@ -22,7 +22,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.config import HarnessSettings, conversation_workspace, get_settings
+from ..infra.config import HarnessSettings, conversation_workspace, get_settings
 
 
 @dataclass
