@@ -19,9 +19,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ..core.config import get_settings
-from ..db import get_session_factory
+from ..infra.config import get_settings
 from ..models import Conversation, Run, Sandbox, UsageEvent, new_id
+from ..models.db import get_session_factory
 from .protocol import RunOutcome, apply_event, parse_line
 from .runner import Runner, SandboxNotFoundError, get_runner
 
