@@ -7,10 +7,10 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from app.controller.manager import Controller
-from app.controller.runner import ExecResult, Runner, SandboxNotFoundError
-from app.db import get_session_factory
+from app.controllers.manager import Controller
+from app.controllers.runner import ExecResult, Runner, SandboxNotFoundError
 from app.models import Conversation, User, new_id
+from app.models.db import get_session_factory
 
 
 @dataclass
@@ -280,8 +280,8 @@ def test_phantom_finalize_when_row_missing() -> None:
     """If the request thread never commits the Run row (crash), the
     worker still persists the outcome as a phantom row rather than
     losing the terminal state."""
-    from app.controller import manager as mgr
-    from app.controller.protocol import RunOutcome
+    from app.controllers import manager as mgr
+    from app.controllers.protocol import RunOutcome
 
     class NullRunner(Runner):
         def create(self, user_id, conversation_id):
@@ -306,8 +306,8 @@ def test_phantom_finalize_when_row_missing() -> None:
     controller = mgr.Controller(runner=NullRunner())
     # do NOT create the Run row; directly invoke _finish_run
     controller._finish_run("run_phantom", RunOutcome(errors=["orphaned"], exit_code=1))
-    from app.db import get_session_factory
     from app.models import Run
+    from app.models.db import get_session_factory
 
     db = get_session_factory()()
     try:
