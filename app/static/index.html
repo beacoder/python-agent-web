@@ -1,172 +1,507 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>python-agent-web</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Excel Agent</title>
 <style>
-  :root { --bg:#0f1115; --fg:#e6e6e6; --accent:#4f8cff; --muted:#8b93a1; }
-  body { margin:0; font:14px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:12px 20px; border-bottom:1px solid #23262e; display:flex; gap:16px; align-items:center; }
-  header h1 { font-size:15px; margin:0; color:var(--accent); }
-  header input { background:#181b21; color:var(--fg); border:1px solid #2a2e37; padding:6px 10px; border-radius:6px; }
-  main { display:flex; height:calc(100vh - 54px); }
-  #sidebar { width:230px; border-right:1px solid #23262e; overflow:auto; padding:8px; }
-  #sidebar .cnv { padding:8px 10px; border-radius:6px; cursor:pointer; color:var(--muted); }
-  #sidebar .cnv.active { background:#1d2129; color:var(--fg); }
-  #chat { flex:1; display:flex; flex-direction:column; }
-  #messages { flex:1; overflow:auto; padding:20px 28px; }
-  .msg { margin:10px 0; white-space:pre-wrap; }
-  .msg.user { color:var(--accent); }
-  .msg.tool { color:var(--muted); font-family:ui-monospace, monospace; font-size:12px; }
-  .msg.err { color:#ff6b6b; }
-  #composer { display:flex; gap:8px; padding:14px 20px; border-top:1px solid #23262e; }
-  #prompt { flex:1; background:#181b21; color:var(--fg); border:1px solid #2a2e37; padding:10px 12px; border-radius:8px; }
-  button { background:var(--accent); border:0; color:#fff; padding:9px 18px; border-radius:8px; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:default; }
-  #auth { max-width:360px; margin:15vh auto; display:flex; flex-direction:column; gap:10px; }
-  #auth input { background:#181b21; color:var(--fg); border:1px solid #2a2e37; padding:10px; border-radius:8px; }
+  :root {
+    --bg: #f7f6f3;
+    --panel: #ffffff;
+    --fg: #1f2328;
+    --muted: #8a8f98;
+    --line: #e8e6e1;
+    --accent: #f97316;
+    --accent-soft: #fff1e7;
+    --accent-fg: #ffffff;
+    --err: #e5484d;
+    --shadow: 0 2px 12px rgba(31, 35, 40, .06);
+  }
+  html[data-theme="dark"] {
+    --bg: #14161a;
+    --panel: #1d2025;
+    --fg: #e6e8eb;
+    --muted: #8b93a1;
+    --line: #2a2e37;
+    --accent-soft: #33261b;
+    --shadow: 0 2px 12px rgba(0, 0, 0, .35);
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--fg); }
+  button { font:inherit; cursor:pointer; }
+
+  /* ---------- top nav ---------- */
+  #topnav { height:56px; display:flex; align-items:center; gap:28px; padding:0 24px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
+  #topnav .logo { display:flex; align-items:center; gap:8px; font-weight:700; font-size:16px; color:var(--accent); }
+  #topnav .logo .mark { width:26px; height:26px; border-radius:7px; background:var(--accent); color:#fff; display:grid; place-items:center; font-size:13px; font-weight:800; }
+  #topnav nav { display:flex; gap:22px; margin:0 auto; }
+  #topnav nav a { color:var(--muted); text-decoration:none; font-size:14px; }
+  #topnav nav a.active { color:var(--accent); font-weight:600; }
+  #topnav .right { display:flex; align-items:center; gap:12px; }
+  #topnav .icon-btn { border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:999px; padding:4px 12px; font-size:13px; }
+  #topnav .user { display:flex; align-items:center; gap:8px; font-size:13px; }
+  #topnav .avatar { width:28px; height:28px; border-radius:50%; background:var(--accent-soft); color:var(--accent); display:grid; place-items:center; font-weight:700; }
+
+  /* ---------- layout ---------- */
+  #app { display:none; }
+  #shell { display:flex; height:calc(100vh - 56px); }
+  #sidebar { width:230px; flex:none; border-right:1px solid var(--line); background:var(--bg); display:flex; flex-direction:column; }
+  #sidebar .head { display:flex; align-items:center; justify-content:space-between; padding:14px 14px 8px; color:var(--accent); font-size:13px; font-weight:600; }
+  #sidebar .head button { border:0; background:none; color:var(--accent); font-size:18px; line-height:1; }
+  #convList { flex:1; overflow:auto; padding:4px 8px; }
+  #convList .empty { color:var(--muted); font-size:13px; padding:12px; }
+  #convList .cnv { padding:9px 12px; border-radius:8px; cursor:pointer; color:var(--muted); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; align-items:center; gap:8px; }
+  #convList .cnv:hover { background:var(--accent-soft); }
+  #convList .cnv.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  #convList .cnv .del { margin-left:auto; visibility:hidden; color:var(--muted); font-size:12px; }
+  #convList .cnv:hover .del { visibility:visible; }
+
+  #main { flex:1; overflow:auto; }
+  .wrap { max-width:980px; margin:0 auto; padding:28px 24px 60px; }
+
+  /* ---------- hero ---------- */
+  #hero { text-align:center; padding:26px 0 8px; }
+  #hero h1 { margin:0 0 10px; font-size:30px; font-weight:800; color:var(--accent); letter-spacing:1px; }
+  #hero p { margin:0 auto; max-width:640px; color:var(--muted); font-size:14px; }
+
+  /* ---------- composer card ---------- */
+  .composer { background:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); margin-top:22px; overflow:hidden; }
+  .composer .label { display:flex; align-items:center; gap:6px; padding:12px 18px 0; font-size:13px; color:var(--muted); }
+  .composer textarea { width:100%; min-height:150px; max-height:320px; resize:vertical; border:0; outline:0; background:transparent; color:var(--fg); font:inherit; padding:10px 18px; }
+  .composer .bar { display:flex; align-items:center; gap:10px; padding:10px 14px; border-top:1px solid var(--line); }
+  .composer .bar .spacer { flex:1; }
+  .chip { display:inline-flex; align-items:center; gap:6px; background:var(--accent-soft); color:var(--accent); border-radius:999px; padding:3px 10px; font-size:12px; }
+  .chip .x { cursor:pointer; font-weight:700; }
+  .attach-btn { border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:10px; padding:6px 12px; font-size:13px; display:inline-flex; align-items:center; gap:6px; }
+  .attach-btn:hover { border-color:var(--accent); color:var(--accent); }
+  #sendBtn { background:var(--accent); color:var(--accent-fg); border:0; border-radius:10px; padding:8px 20px; font-size:14px; font-weight:600; display:inline-flex; align-items:center; gap:8px; }
+  #sendBtn:disabled { opacity:.5; cursor:default; }
+  .stop-btn { background:transparent; color:var(--muted); border:1px solid var(--line); border-radius:10px; padding:8px 16px; display:none; }
+  .count { color:var(--muted); font-size:12px; padding:0 18px 8px; text-align:right; }
+
+  /* ---------- task type cards ---------- */
+  #tasks { margin-top:34px; }
+  #tasks .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }
+  #tasks .head h2 { margin:0; font-size:17px; font-weight:700; }
+  #tasks .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:14px; }
+  .task { background:var(--panel); border:2px solid var(--line); border-radius:14px; overflow:hidden; cursor:pointer; box-shadow:var(--shadow); text-align:left; padding:0; }
+  .task:hover { border-color:var(--accent); }
+  .task .thumb { height:84px; display:grid; place-items:center; font-size:34px; background:linear-gradient(135deg, var(--accent-soft), var(--panel)); }
+  .task .name { padding:8px 12px; font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px; }
+  .task .name::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--accent); }
+
+  /* ---------- chat ---------- */
+  #chat { display:none; }
+  #messages { padding:6px 0 20px; }
+  .msg { margin:14px 0; padding:12px 16px; border-radius:12px; white-space:pre-wrap; word-break:break-word; max-width:85%; }
+  .msg.user { background:var(--accent-soft); color:var(--fg); margin-left:auto; border:1px solid var(--line); }
+  .msg.agent { background:var(--panel); border:1px solid var(--line); box-shadow:var(--shadow); }
+  .msg.tool { background:transparent; border:1px dashed var(--line); color:var(--muted); font-family:ui-monospace, monospace; font-size:12px; max-width:100%; }
+  .msg.err { background:transparent; border:1px solid var(--err); color:var(--err); max-width:100%; }
+  .msg .who { font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .msg pre { background:rgba(0,0,0,.05); border-radius:8px; padding:10px; overflow:auto; font-size:12px; }
+  .artifact { display:inline-flex; align-items:center; gap:6px; background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:5px 14px; font-size:13px; text-decoration:none; color:var(--fg); box-shadow:var(--shadow); }
+  .artifact:hover { border-color:var(--accent); color:var(--accent); }
+  .artifact .size { color:var(--muted); font-size:11px; }
+  html[data-theme="dark"] .msg pre { background:rgba(255,255,255,.06); }
+
+  /* ---------- auth ---------- */
+  #auth { display:none; min-height:calc(100vh - 56px); align-items:center; justify-content:center; }
+  #auth .card { background:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); width:380px; padding:30px; display:flex; flex-direction:column; gap:12px; }
+  #auth h2 { margin:0 0 6px; text-align:center; color:var(--accent); }
+  #auth input { background:var(--bg); color:var(--fg); border:1px solid var(--line); padding:11px 12px; border-radius:10px; font:inherit; }
+  #auth .btn { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:11px; font-weight:600; }
+  #authMsg { color:var(--muted); font-size:13px; text-align:center; }
 </style>
 </head>
 <body>
-<div id="auth">
-  <h2>python-agent-web</h2>
-  <input id="email" placeholder="email">
-  <input id="password" type="password" placeholder="password">
-  <button id="loginBtn">Sign in / Register</button>
-  <div id="authMsg" style="color:var(--muted)"></div>
+<div id="topnav">
+  <div class="logo"><span class="mark">X</span> Excel Agent</div>
+  <nav>
+    <a href="#" class="active">首页</a>
+    <a href="#">案例</a>
+    <a href="#">工具</a>
+    <a href="#">开始创作</a>
+    <a href="#">价格</a>
+  </nav>
+  <div class="right">
+    <button class="icon-btn" id="themeBtn">🌙 深色</button>
+    <div class="user"><span class="avatar" id="avatar">?</span><span id="whoami"></span></div>
+  </div>
 </div>
-<div id="app" style="display:none">
-  <header>
-    <h1>python-agent-web</h1>
-    <input id="title" placeholder="conversation title" style="width:240px">
-    <span id="usage" style="color:var(--muted);margin-left:auto"></span>
-  </header>
-  <main>
-    <div id="sidebar"></div>
-    <div id="chat">
-      <div id="messages"></div>
-      <div id="composer">
-        <input id="prompt" placeholder="ask the agent… (Enter to send)">
-        <button id="sendBtn">Send</button>
-        <button id="cancelBtn" disabled>Stop</button>
+
+<div id="auth">
+  <div class="card">
+    <h2>Excel Agent</h2>
+    <input id="email" placeholder="邮箱" autocomplete="username">
+    <input id="password" type="password" placeholder="密码（至少 8 位）" autocomplete="current-password">
+    <button class="btn" id="loginBtn">登录 / 注册</button>
+    <div id="authMsg"></div>
+  </div>
+</div>
+
+<div id="app">
+  <div id="shell">
+    <div id="sidebar">
+      <div class="head"><span>历史创作</span><button id="newConvBtn" title="新建对话">＋</button></div>
+      <div id="convList"></div>
+    </div>
+    <div id="main">
+      <div class="wrap">
+        <div id="home">
+          <div id="hero">
+            <h1>一句话处理 Excel 表格</h1>
+            <p>无需编写公式或代码，上传你的 Excel 文件，描述需求，AI 即刻完成数据清洗、公式计算、图表生成与报表输出。</p>
+          </div>
+          <div class="composer">
+            <div class="label">📋 描述你的 Excel 任务</div>
+            <textarea id="promptBox" placeholder="输入任务描述，例如：把销售表按区域汇总，计算同比增长率，并生成一张柱状图…"></textarea>
+            <div class="count"><span id="charCount">0</span>/5000</div>
+            <div class="bar">
+              <button class="attach-btn" id="attachBtn">📎 上传文件</button>
+              <input type="file" id="fileInput" accept=".xlsx,.xls,.csv,.xlsm" multiple style="display:none">
+              <span id="fileChips" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+              <span class="spacer"></span>
+              <button class="stop-btn" id="stopBtn">停止</button>
+              <button id="sendBtn">✨ 一键处理</button>
+            </div>
+          </div>
+          <div id="tasks">
+            <div class="head"><h2>选择任务类型</h2></div>
+            <div class="grid" id="taskGrid"></div>
+          </div>
+        </div>
+        <div id="chat">
+          <div id="messages"></div>
+          <div id="artifacts" style="display:none">
+            <div style="font-size:13px;color:var(--muted);margin:8px 0 6px">📦 生成的文件（点击下载）</div>
+            <div id="artifactChips" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+          </div>
+          <div class="composer">
+            <div class="label">📋 继续描述你的 Excel 任务</div>
+            <textarea id="promptBox2" placeholder="继续输入任务描述…（Enter 发送，Shift+Enter 换行）" style="min-height:80px"></textarea>
+            <div class="bar">
+              <button class="attach-btn" id="attachBtn2">📎 上传文件</button>
+              <input type="file" id="fileInput2" accept=".xlsx,.xls,.csv,.xlsm" multiple style="display:none">
+              <span id="fileChips2" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+              <span class="spacer"></span>
+              <button class="stop-btn" id="stopBtn2">停止</button>
+              <button id="sendBtn2" style="background:var(--accent);color:var(--accent-fg);border:0;border-radius:10px;padding:8px 20px;font-weight:600">发送</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
-  </main>
+  </div>
 </div>
+
 <script>
+const TASKS = [
+  { icon: "🧹", name: "数据清洗", tpl: "请清洗上传的表格：去除重复行、处理缺失值、统一日期与数字格式，输出清洗后的文件。" },
+  { icon: "🧮", name: "公式计算", tpl: "请在表格中新增计算列（如合计、占比、同比增长率），并说明使用的公式。" },
+  { icon: "📊", name: "图表生成", tpl: "请根据表格数据生成合适的图表（柱状图/折线图/饼图），保存为图片并给出分析结论。" },
+  { icon: "🎨", name: "格式美化", tpl: "请美化表格：设置表头样式、列宽、数字格式、冻结首行，并添加边框。" },
+  { icon: "🔗", name: "数据合并", tpl: "请将上传的多个表格按关键列合并（VLOOKUP/JOIN 语义），输出合并后的结果。" },
+  { icon: "📑", name: "报表生成", tpl: "请基于表格数据生成一份汇总报表：关键指标、分组统计，并输出为新的 Excel 文件。" },
+];
+
 const api = {
   token: sessionStorage.getItem('token') || '',
-  async req(path, opts={}) {
-    const res = await fetch(path, {...opts, headers: {
-      'Content-Type': 'application/json',
-      ...(this.token ? {Authorization: 'Bearer ' + this.token} : {}),
-      ...(opts.headers||{})}});
-    if (res.status === 401) { showAuth('session expired'); throw new Error('unauthorized'); }
+  async req(path, opts = {}) {
+    const res = await fetch(path, { ...opts, headers: {
+      ...(opts.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+      ...(this.token ? { Authorization: 'Bearer ' + this.token } : {}),
+      ...(opts.headers || {}),
+    }});
+    if (res.status === 401) { showAuth('登录已过期，请重新登录'); throw new Error('unauthorized'); }
     return res;
   }
 };
 const $ = id => document.getElementById(id);
-const msgs = $('messages');
 let currentConv = null, currentRun = null, es = null;
+let pendingFiles = [];   // uploaded file rows for the current conversation
 
-function showAuth(msg) { $('app').style.display='none'; $('auth').style.display='flex';
-  $('authMsg').textContent = msg || ''; sessionStorage.removeItem('token'); api.token=''; }
-function showApp() { $('auth').style.display='none'; $('app').style.display='block'; loadConversations(); loadUsage(); }
-
-function add(kind, text) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + kind; div.textContent = text;
-  msgs.appendChild(div); msgs.scrollTop = msgs.scrollHeight; return div;
+function showAuth(msg) {
+  $('app').style.display = 'none'; $('auth').style.display = 'flex';
+  $('authMsg').textContent = msg || '';
+  sessionStorage.removeItem('token'); api.token = '';
+}
+function showApp() {
+  $('auth').style.display = 'none'; $('app').style.display = 'block';
+  loadConversations(); loadMe();
 }
 
 function errMsg(res) {
   return res.json().then(j => {
     const d = j.detail ?? j;
-    return Array.isArray(d) ? d.map(e => `${(e.loc||[]).slice(1).join('.')}: ${e.msg}`).join('; ') : String(d);
+    return Array.isArray(d) ? d.map(e => `${(e.loc || []).slice(1).join('.')}: ${e.msg}`).join('; ') : String(d);
   }).catch(() => res.statusText || 'request failed');
 }
+
+/* ---------- auth ---------- */
 $('loginBtn').onclick = async () => {
   const email = $('email').value.trim(), password = $('password').value;
-  let res = await fetch('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({email, password})});
+  let res = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }) });
   if (res.status === 401 || res.status === 403) {
-    res = await fetch('/auth/register', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({email, password})});
+    res = await fetch('/auth/register', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }) });
   }
-  if (!res.ok) { $('authMsg').textContent = 'auth failed: ' + await errMsg(res); return; }
+  if (!res.ok) { $('authMsg').textContent = '登录失败: ' + await errMsg(res); return; }
   const tokens = await res.json();
-  api.token = tokens.access_token; sessionStorage.setItem('token', api.token); showApp();
+  api.token = tokens.access_token; sessionStorage.setItem('token', api.token);
+  showApp();
 };
 $('password').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
 
+async function loadMe() {
+  const res = await api.req('/auth/me');
+  if (!res.ok) return;
+  const me = await res.json();
+  $('whoami').textContent = me.email;
+  $('avatar').textContent = me.email[0].toUpperCase();
+}
+
+/* ---------- theme ---------- */
+$('themeBtn').onclick = () => {
+  const dark = document.documentElement.dataset.theme === 'dark';
+  document.documentElement.dataset.theme = dark ? '' : 'dark';
+  $('themeBtn').textContent = dark ? '🌙 深色' : '☀️ 浅色';
+};
+
+/* ---------- conversations ---------- */
 async function loadConversations() {
   const res = await api.req('/conversations');
   const list = await res.json();
-  $('sidebar').innerHTML = '';
+  const box = $('convList'); box.innerHTML = '';
+  if (!list.length) { box.innerHTML = '<div class="empty">暂无历史作品</div>'; return; }
   for (const c of list) {
     const div = document.createElement('div');
     div.className = 'cnv' + (c.id === currentConv ? ' active' : '');
-    div.textContent = c.title;
-    div.onclick = () => openConversation(c.id, c.title);
-    $('sidebar').appendChild(div);
+    div.innerHTML = `<span style="overflow:hidden;text-overflow:ellipsis">${escapeHtml(c.title)}</span><span class="del" title="删除">✕</span>`;
+    div.onclick = e => {
+      if (e.target.classList.contains('del')) { deleteConversation(c.id); return; }
+      openConversation(c.id, c.title);
+    };
+    box.appendChild(div);
   }
 }
-async function loadUsage() {
-  const res = await api.req('/usage/summary');
-  const u = await res.json();
-  $('usage').textContent = `${u.input_tokens} in / ${u.output_tokens} out / ${u.rounds} rounds`;
+async function deleteConversation(id) {
+  if (!confirm('删除该对话及其上传文件？')) return;
+  await api.req('/conversations/' + id, { method: 'DELETE' });
+  if (currentConv === id) newConversation();
+  loadConversations();
+}
+function newConversation() {
+  currentConv = null; currentRun = null;
+  if (es) { es.close(); es = null; }
+  pendingFiles = [];
+  renderFiles();
+  $('artifacts').style.display = 'none';
+  $('promptBox').value = ''; $('charCount').textContent = '0';
+  $('home').style.display = 'block'; $('chat').style.display = 'none';
+  loadConversations();
+}
+$('newConvBtn').onclick = newConversation;
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 async function openConversation(id, title) {
-  currentConv = id; $('title').value = title; msgs.innerHTML = '';
+  currentConv = id;
+  if (es) { es.close(); es = null; }
+  currentRun = null;
   const res = await api.req('/conversations/' + id);
   const detail = await res.json();
+  pendingFiles = detail.files || [];
+  renderFiles();
+  $('home').style.display = 'none'; $('chat').style.display = 'block';
+  const box = $('messages'); box.innerHTML = '';
   for (const run of detail.runs) {
-    add('user', run.prompt);
-    if (run.answer) add('', run.answer);
-    if (run.error) add('err', run.error);
+    addMsg('user', run.prompt);
+    if (run.answer) addMsg('agent', run.answer);
+    if (run.error) addMsg('err', run.error);
   }
   loadConversations();
+  loadArtifacts();
 }
-$('title').addEventListener('change', async () => { /* rename: PUT when supported */ });
+
+/* ---------- artifacts ---------- */
+async function loadArtifacts() {
+  const box = $('artifactChips');
+  if (!currentConv) { $('artifacts').style.display = 'none'; return; }
+  const res = await api.req(`/conversations/${currentConv}/artifacts`);
+  if (!res.ok) { $('artifacts').style.display = 'none'; return; }
+  const list = await res.json();
+  box.innerHTML = '';
+  for (const a of list) {
+    const link = document.createElement('a');
+    link.className = 'artifact';
+    link.href = '#';
+    link.innerHTML = `⬇ ${escapeHtml(a.name)} <span class="size">${fmtSize(a.size)}</span>`;
+    link.onclick = async e => {
+      e.preventDefault();
+      const r = await api.req(`/conversations/${currentConv}/artifacts/${encodeURIComponent(a.name)}`);
+      if (!r.ok) { alert('下载失败'); return; }
+      const url = URL.createObjectURL(await r.blob());
+      const tmp = document.createElement('a');
+      tmp.href = url; tmp.download = a.name; tmp.click();
+      URL.revokeObjectURL(url);
+    };
+    box.appendChild(link);
+  }
+  $('artifacts').style.display = list.length ? 'block' : 'none';
+}
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+/* ---------- files ---------- */
+function renderFiles() {
+  for (const box of [$('fileChips'), $('fileChips2')]) {
+    box.innerHTML = '';
+    for (const f of pendingFiles) {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.innerHTML = `📄 ${escapeHtml(f.filename)} <span class="x" title="移除">✕</span>`;
+      chip.querySelector('.x').onclick = async () => {
+        await api.req(`/conversations/${currentConv}/files/${f.id}`, { method: 'DELETE' });
+        pendingFiles = pendingFiles.filter(x => x.id !== f.id);
+        renderFiles();
+      };
+      box.appendChild(chip);
+    }
+  }
+}
+async function uploadFiles(input) {
+  const files = [...input.files]; input.value = '';
+  if (!files.length) return;
+  if (!currentConv) {
+    const res = await api.req('/conversations', { method: 'POST', body: JSON.stringify({ title: 'Excel 任务' }) });
+    const c = await res.json(); currentConv = c.id;
+  }
+  for (const f of files) {
+    const fd = new FormData(); fd.append('file', f);
+    const res = await api.req(`/conversations/${currentConv}/files`, { method: 'POST', body: fd });
+    if (!res.ok) { alert('上传失败: ' + await errMsg(res)); continue; }
+    pendingFiles.push(await res.json());
+  }
+  renderFiles();
+  loadConversations();
+}
+$('attachBtn').onclick = () => $('fileInput').click();
+$('attachBtn2').onclick = () => $('fileInput2').click();
+$('fileInput').onchange = e => uploadFiles(e.target);
+$('fileInput2').onchange = e => uploadFiles(e.target);
+
+/* ---------- task cards ---------- */
+const grid = $('taskGrid');
+for (const t of TASKS) {
+  const btn = document.createElement('button');
+  btn.className = 'task';
+  btn.innerHTML = `<div class="thumb">${t.icon}</div><div class="name">${t.name}</div>`;
+  btn.onclick = () => {
+    const box = $('promptBox');
+    box.value = (box.value ? box.value + '\n' : '') + t.tpl;
+    $('charCount').textContent = box.value.length;
+    box.focus();
+  };
+  grid.appendChild(btn);
+}
+$('promptBox').addEventListener('input', e => { $('charCount').textContent = e.target.value.length; });
+
+/* ---------- chat ---------- */
+function addMsg(kind, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind;
+  if (kind === 'agent') {
+    div.innerHTML = `<div class="who">AI</div>`;
+    div.appendChild(renderAnswer(text));
+  } else {
+    div.textContent = text;
+  }
+  $('messages').appendChild(div);
+  $('messages').scrollTop = $('messages').scrollHeight;
+  return div;
+}
+function renderAnswer(text) {
+  // minimal markdown: code fences + bold
+  const parts = String(text).split(/```/);
+  const frag = document.createDocumentFragment();
+  parts.forEach((p, i) => {
+    if (i % 2 === 1) {
+      const nl = p.indexOf('\n');
+      const pre = document.createElement('pre');
+      pre.textContent = nl >= 0 ? p.slice(nl + 1) : p;
+      frag.appendChild(pre);
+    } else {
+      const span = document.createElement('span');
+      span.innerHTML = escapeHtml(p).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+      frag.appendChild(span);
+    }
+  });
+  return frag;
+}
 
 function startStream(runId) {
-  currentRun = runId; $('cancelBtn').disabled = false;
+  currentRun = runId;
+  $('stopBtn2').style.display = 'inline-block';
   const url = `/conversations/${currentConv}/runs/${runId}/stream?access_token=${encodeURIComponent(api.token)}`;
   es = new EventSource(url);
+  let agentDiv = null;
   es.onmessage = ev => {
     const e = JSON.parse(ev.data);
-    if (e.type === 'delta') { /* deltas collapse into the final answer */ }
-    else if (e.type === 'notify' && e.data && e.data.kind === 'tool_start')
-      add('tool', '· tools: ' + (e.data.data || []).join(', '));
-    else if (e.type === 'notify' && e.data && e.data.kind === 'error')
-      add('err', e.data.data);
-    else if (e.type === 'run') {
-      es.close(); es = null; currentRun = null; $('cancelBtn').disabled = true;
-      openConversation(currentConv, $('title').value); loadUsage();
+    if (e.type === 'delta') {
+      if (!agentDiv) agentDiv = addMsg('agent', '');
+      agentDiv.lastChild.textContent = (agentDiv.lastChild.textContent || '') + (e.data?.text ?? '');
+      $('messages').scrollTop = $('messages').scrollHeight;
+    } else if (e.type === 'notify' && e.data && e.data.kind === 'tool_start') {
+      addMsg('tool', '· 工具: ' + (e.data.data || []).join(', '));
+    } else if (e.type === 'notify' && e.data && e.data.kind === 'error') {
+      addMsg('err', e.data.data);
+    } else if (e.type === 'run') {
+      es.close(); es = null; currentRun = null;
+      $('stopBtn2').style.display = 'none';
+      openConversation(currentConv, '');
+      loadConversations();
+      loadArtifacts();
     }
   };
-  es.onerror = () => { /* retry handled by refreshing on run end */ };
+  es.onerror = () => { /* refreshed on run end */ };
 }
 
 async function send() {
-  const prompt = $('prompt').value.trim(); if (!prompt) return;
-  $('prompt').value = ''; add('user', prompt);
+  const prompt = $('promptBox2').value.trim();
+  if (!prompt) return;
+  $('promptBox2').value = '';
+  addMsg('user', prompt);
   if (!currentConv) {
-    const res = await api.req('/conversations', {method:'POST', body: JSON.stringify({title: prompt.slice(0, 60)})});
+    const res = await api.req('/conversations', { method: 'POST', body: JSON.stringify({ title: prompt.slice(0, 40) }) });
     const c = await res.json(); currentConv = c.id;
   }
   const res = await api.req(`/conversations/${currentConv}/runs`,
-    {method:'POST', body: JSON.stringify({prompt})});
-  if (!res.ok) { add('err', await errMsg(res)); return; }
+    { method: 'POST', body: JSON.stringify({ prompt }) });
+  if (!res.ok) { addMsg('err', await errMsg(res)); return; }
   const run = await res.json();
   startStream(run.id);
 }
-$('sendBtn').onclick = send;
-$('prompt').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-$('cancelBtn').onclick = async () => {
+$('sendBtn').onclick = () => {
+  const p = $('promptBox').value.trim();
+  if (!p) return;
+  $('promptBox2').value = p;
+  $('home').style.display = 'none'; $('chat').style.display = 'block';
+  send();
+};
+$('sendBtn2').onclick = send;
+$('promptBox2').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$('stopBtn').onclick = $('stopBtn2').onclick = async () => {
   if (!currentRun) return;
-  await api.req(`/conversations/${currentConv}/runs/${currentRun}/cancel`, {method:'POST'});
+  await api.req(`/conversations/${currentConv}/runs/${currentRun}/cancel`, { method: 'POST' });
 };
 
 if (api.token) showApp();
