@@ -6,10 +6,10 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..db import get_db
 from ..models import Conversation, Run, UsageEvent, User
+from ..models.db import get_db
 from ..routes.auth import authenticate_user
-from ..schemas import UsageSummary
+from ..validation.schemas import UsageSummary
 
 router = APIRouter(prefix="/usage", tags=["billing"])
 
