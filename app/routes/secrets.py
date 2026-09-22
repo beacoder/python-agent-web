@@ -11,11 +11,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..core import secrets_store
-from ..db import commit_now, get_db
+from ..infra import secrets_store
 from ..models import Secret, User, new_id
+from ..models.db import commit_now, get_db
 from ..routes.auth import authenticate_user
-from ..schemas import SecretIn, SecretOut
+from ..validation.schemas import SecretIn, SecretOut
 
 router = APIRouter(prefix="/secrets", tags=["secrets"])
 
