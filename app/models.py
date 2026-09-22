@@ -120,6 +120,27 @@ class Secret(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ConversationFile(Base):
+    """An uploaded file attached to a conversation.
+
+    Stored on disk inside the conversation's sandbox workspace so the
+    agent can read it directly; ``path`` is the absolute location.
+    """
+
+    __tablename__ = "conversation_files"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(40), index=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    stored_name: Mapped[str] = mapped_column(String(255))
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    path: Mapped[str] = mapped_column(String(1024))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    conversation: Mapped[Conversation] = relationship()
+
+
 class Sandbox(Base):
     """Sandbox registry: one row per live (or recently live) sandbox.
 
