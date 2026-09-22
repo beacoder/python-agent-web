@@ -19,6 +19,7 @@ def _isolated_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("PAW_DB_URL", f"sqlite:///{tmp}/test.db")
     monkeypatch.setenv("PAW_SECRET_KEY", "test-secret-key-not-for-prod-0123456789abcdef")
     monkeypatch.setenv("PAW_RUNNER", "server")
+    monkeypatch.setenv("PAW_WORKSPACE_ROOT", f"{tmp}/workspaces")
     get_settings.cache_clear()
     db_mod._engine = None
     db_mod._session_factory = None
