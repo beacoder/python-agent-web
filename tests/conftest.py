@@ -8,8 +8,8 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-import app.db as db_mod
-from app.core.config import get_settings
+import app.models.db as db_mod
+from app.infra.config import get_settings
 from app.main import create_app
 
 
@@ -31,7 +31,7 @@ def _isolated_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 @pytest.fixture()
 def client() -> Iterator[TestClient]:
-    from app.db import reset_engine_for_tests
+    from app.models.db import reset_engine_for_tests
 
     reset_engine_for_tests(get_settings().db_url)
     app = create_app()
