@@ -14,9 +14,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .controller.manager import get_controller
-from .core.config import get_settings
-from .db import get_engine
+from .controllers.manager import get_controller
+from .infra.config import get_settings
+from .models.db import get_engine
 from .routes import auth, billing, conversations, secrets
 
 
@@ -54,7 +54,7 @@ def create_app() -> FastAPI:
     def healthz() -> dict:
         return {"ok": True, "runner": settings.runner}
 
-    static_dir = Path(__file__).parent / "static"
+    static_dir = Path(__file__).parent / "views"
     if static_dir.is_dir():
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="ui")
     return app
