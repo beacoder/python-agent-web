@@ -60,8 +60,24 @@ class ConversationOut(BaseModel):
     updated_at: datetime
 
 
+class FileOut(BaseModel):
+    id: str
+    filename: str
+    size: int
+    created_at: datetime
+
+
+class ArtifactOut(BaseModel):
+    """A file the agent produced in its workspace (downloadable)."""
+
+    name: str
+    size: int
+    modified_at: datetime
+
+
 class ConversationDetail(ConversationOut):
     runs: list[RunOut] = []
+    files: list[FileOut] = []
 
 
 # --- runs ---
