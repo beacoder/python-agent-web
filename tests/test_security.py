@@ -5,8 +5,8 @@ from __future__ import annotations
 import jwt as pyjwt
 import pytest
 
-from app.core.config import get_settings
-from app.core.security import (
+from app.infra.config import get_settings
+from app.infra.security import (
     create_access_token,
     create_refresh_token,
     create_token,
