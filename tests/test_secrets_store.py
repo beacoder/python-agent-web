@@ -5,11 +5,11 @@ from __future__ import annotations
 import pytest
 from cryptography.fernet import Fernet
 
-from app.core import secrets_store
+from app.infra import secrets_store
 
 
 def test_explicit_fernet_key_used(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.core.config import get_settings
+    from app.infra.config import get_settings
 
     key = Fernet.generate_key().decode()
     monkeypatch.setattr(get_settings(), "fernet_key", key)
@@ -18,7 +18,7 @@ def test_explicit_fernet_key_used(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_bad_fernet_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.core.config import get_settings
+    from app.infra.config import get_settings
 
     monkeypatch.setattr(get_settings(), "fernet_key", "not-a-valid-fernet-key")
     with pytest.raises(ValueError, match="32 url-safe base64"):
@@ -26,7 +26,7 @@ def test_bad_fernet_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_decrypt_wrong_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.core.config import get_settings
+    from app.infra.config import get_settings
 
     token = secrets_store.encrypt("payload")
     monkeypatch.setattr(get_settings(), "fernet_key", Fernet.generate_key().decode())
@@ -35,7 +35,7 @@ def test_decrypt_wrong_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_derived_key_survives_restart(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.core.config import get_settings
+    from app.infra.config import get_settings
 
     monkeypatch.setattr(get_settings(), "fernet_key", "")
     token = secrets_store.encrypt("stable")
