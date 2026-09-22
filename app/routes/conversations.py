@@ -15,12 +15,12 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from ..controller.manager import Controller, get_controller
-from ..core.config import conversation_workspace, get_settings
-from ..db import commit_now, get_db
+from ..controllers.manager import Controller, get_controller
+from ..infra.config import conversation_workspace, get_settings
 from ..models import Conversation, ConversationFile, Run, User, new_id
+from ..models.db import commit_now, get_db
 from ..routes.auth import authenticate_user
-from ..schemas import (
+from ..validation.schemas import (
     ArtifactOut,
     ConversationCreate,
     ConversationDetail,
