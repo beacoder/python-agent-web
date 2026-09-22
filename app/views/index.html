@@ -103,6 +103,14 @@
   .artifact { display:inline-flex; align-items:center; gap:6px; background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:5px 14px; font-size:13px; text-decoration:none; color:var(--fg); box-shadow:var(--shadow); }
   .artifact:hover { border-color:var(--accent); color:var(--accent); }
   .artifact .size { color:var(--muted); font-size:11px; }
+  #runStatus { margin:10px 0 0; font-size:13px; color:var(--muted); display:flex; align-items:center; gap:8px; }
+  #runStatus .spin { display:inline-block; animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #todoPanel { margin:10px 0 0; background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); padding:10px 14px; }
+  #todoPanel .t-title { font-size:12px; color:var(--muted); margin-bottom:6px; font-weight:600; }
+  #todoPanel .t-item { font-size:13px; padding:2px 0; display:flex; gap:8px; align-items:baseline; }
+  #todoPanel .t-item.done { color:var(--muted); text-decoration:line-through; }
+  #todoPanel .t-item.doing { color:var(--accent); font-weight:600; }
   html[data-theme="dark"] .msg pre { background:rgba(255,255,255,.06); }
 
   /* ---------- auth ---------- */
@@ -172,6 +180,8 @@
           </div>
         </div>
         <div id="chat">
+          <div id="runStatus" style="display:none"></div>
+          <div id="todoPanel" style="display:none"></div>
           <div id="messages"></div>
           <div id="artifacts" style="display:none">
             <div style="font-size:13px;color:var(--muted);margin:8px 0 6px">📦 生成的文件（点击下载）</div>
@@ -297,6 +307,8 @@ function newConversation() {
   if (es) { es.close(); es = null; }
   pendingFiles = [];
   renderFiles();
+  setRunStatus('', false);
+  renderTodos(null);
   $('artifacts').style.display = 'none';
   $('promptBox').value = ''; $('charCount').textContent = '0';
   $('home').style.display = 'block'; $('chat').style.display = 'none';
@@ -312,6 +324,8 @@ async function openConversation(id, title) {
   currentConv = id;
   if (es) { es.close(); es = null; }
   currentRun = null;
+  setRunStatus('', false);
+  renderTodos(null);
   const res = await api.req('/conversations/' + id);
   const detail = await res.json();
   pendingFiles = detail.files || [];
@@ -446,9 +460,79 @@ function renderAnswer(text) {
   return frag;
 }
 
+function addAsk(data, runId) {
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  const questions = (data && data.questions) || [];
+  div.innerHTML = '<div class="who">AI 提问</div>';
+  for (const q of questions) {
+    const qtext = q.question || q.text || JSON.stringify(q);
+    const opts = q.options || [];
+    const row = document.createElement('div');
+    row.style.margin = '8px 0';
+    row.innerHTML = `<div>${escapeHtml(qtext)}</div>`;
+    const input = document.createElement('input');
+    input.style.cssText = 'width:100%;margin-top:6px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;color:var(--fg)';
+    input.placeholder = opts.length ? '选择或输入…' : '输入回答…';
+    row.appendChild(input);
+    div.appendChild(row);
+    if (opts.length) {
+      for (const o of opts) {
+        const label = typeof o === 'string' ? o : (o.label || JSON.stringify(o));
+        const b = document.createElement('button');
+        b.className = 'attach-btn'; b.style.margin = '0 6px 6px 0';
+        b.textContent = label;
+        b.onclick = () => { input.value = label; };
+        row.appendChild(b);
+      }
+    }
+  }
+  const send = document.createElement('button');
+  send.id = 'askSend';
+  send.style.cssText = 'background:var(--accent);color:#fff;border:0;border-radius:8px;padding:7px 16px;margin-top:6px';
+  send.textContent = '回答';
+  send.onclick = async () => {
+    const answers = [...div.querySelectorAll('input')].map(i => i.value.trim()).filter(Boolean);
+    if (!answers.length) return;
+    send.disabled = true;
+    const res = await api.req(`/conversations/${currentConv}/runs/${runId}/answer`,
+      { method: 'POST', body: JSON.stringify({ answers }) });
+    if (!res.ok) { send.disabled = false; addMsg('err', await errMsg(res)); return; }
+    div.style.opacity = '.5';
+  };
+  div.appendChild(send);
+  $('messages').appendChild(div);
+  $('messages').scrollTop = $('messages').scrollHeight;
+}
+
+function strData(d) {
+  if (d == null) return '';
+  if (typeof d === 'string') return d;
+  if (Array.isArray(d)) return d.map(strData).join(', ');
+  return JSON.stringify(d);
+}
+function setRunStatus(text, busy) {
+  const box = $('runStatus');
+  if (!text) { box.style.display = 'none'; return; }
+  box.style.display = 'flex';
+  box.innerHTML = (busy ? '<span class="spin">⚙️</span>' : '') + '<span>' + escapeHtml(text) + '</span>';
+}
+function renderTodos(items) {
+  const box = $('todoPanel');
+  if (!items || !items.length) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  box.innerHTML = '<div class="t-title">📋 任务进度</div>' + items.map(t => {
+    const s = String(t.status || '');
+    const cls = /done|complete/i.test(s) ? 'done' : /progress|active|current/i.test(s) ? 'doing' : '';
+    const icon = cls === 'done' ? '✅' : cls === 'doing' ? '🔄' : '⬜';
+    return `<div class="t-item ${cls}"><span>${icon}</span><span>${escapeHtml(t.content || '')}</span></div>`;
+  }).join('');
+}
+
 function startStream(runId) {
   currentRun = runId;
   $('stopBtn2').style.display = 'inline-block';
+  setRunStatus('正在启动…', true);
   const url = `/conversations/${currentConv}/runs/${runId}/stream?access_token=${encodeURIComponent(api.token)}`;
   es = new EventSource(url);
   let agentDiv = null;
@@ -458,13 +542,31 @@ function startStream(runId) {
       if (!agentDiv) agentDiv = addMsg('agent', '');
       agentDiv.lastChild.textContent = (agentDiv.lastChild.textContent || '') + (e.data?.text ?? '');
       $('messages').scrollTop = $('messages').scrollHeight;
-    } else if (e.type === 'notify' && e.data && e.data.kind === 'tool_start') {
-      addMsg('tool', '· 工具: ' + (e.data.data || []).join(', '));
-    } else if (e.type === 'notify' && e.data && e.data.kind === 'error') {
-      addMsg('err', e.data.data);
+    } else if (e.type === 'notify' && e.data) {
+      const kind = e.data.kind, data = e.data.data;
+      if (kind === 'tool_start') {
+        setRunStatus('准备执行: ' + strData(data), true);
+      } else if (kind === 'tool_running') {
+        setRunStatus('正在执行: ' + strData(data), true);
+      } else if (kind === 'tool') {
+        setRunStatus('工具执行完成', true);
+      } else if (kind === 'todos') {
+        renderTodos(data);
+      } else if (kind === 'error') {
+        addMsg('err', typeof data === 'string' ? data : JSON.stringify(data));
+      } else if (kind === 'retry') {
+        setRunStatus('模型调用重试中…', true);
+      } else if (kind === 'compact') {
+        setRunStatus('正在压缩上下文…', true);
+      } else if (kind === 'ask' || kind === 'confirm') {
+        addAsk(data, runId);
+      }
+    } else if (e.type === 'log' && e.data && e.data.message) {
+      setRunStatus(e.data.message, true);
     } else if (e.type === 'run') {
       es.close(); es = null; currentRun = null;
       $('stopBtn2').style.display = 'none';
+      setRunStatus('', false);
       openConversation(currentConv, '');
       loadConversations();
       loadArtifacts();
