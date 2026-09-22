@@ -2,7 +2,7 @@
 
 # python-agent-web
 
-**Web/API platform for python-agent-harness.**
+**A minimal Web interface for validating agent runtime and interaction patterns.**
 
 </div>
 
@@ -50,8 +50,8 @@ app/
   schemas.py       Pydantic request/response models
   routes/
     auth.py        POST /auth/register /auth/login /auth/refresh /auth/me
-    conversations.py  CRUD + POST /{id}/runs (start) + POST /{id}/answer
-                      + GET /{id}/stream (SSE)
+    conversations.py  CRUD + POST /{id}/files (upload) + POST /{id}/runs (start)
+                      + POST /{id}/answer + GET /{id}/stream (SSE)
     billing.py     usage summary (token ledger)
     secrets.py     CRUD (write-only read: value never returned)
   controller/
@@ -102,7 +102,8 @@ no signal semantics.
 | `PAW_ACCESS_TOKEN_MINUTES` | `30` | JWT access TTL |
 | `PAW_REFRESH_TOKEN_DAYS` | `14` | JWT refresh TTL |
 | `PAW_HARNESS__CMD` | `python-agent-harness` | harness binary |
-| `PAW_HARNESS__CWD` | `""` | agent workspace dir per sandbox |
+| `PAW_HARNESS__CWD` | `""` | agent workspace dir per sandbox (overrides per-conversation workspaces) |
+| `PAW_WORKSPACE_ROOT` | `./workspaces` | base dir for per-conversation workspaces; uploads land in `<root>/<conversation_id>/` |
 | `PAW_HARNESS__TIMEOUT` | unset | host-side wall-clock budget for one run |
 | `PAW_RUNNER` | `server` | `server` only; docker later |
 | `PAW_SANDBOX__TTL_SECONDS` | `300` | idle reaper TTL |
