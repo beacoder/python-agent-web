@@ -8,16 +8,16 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..core.security import (
+from ..infra.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
     hash_password,
     verify_password,
 )
-from ..db import commit_now, get_db
 from ..models import User, new_id
-from ..schemas import RefreshIn, RegisterIn, TokenPair, UserOut
+from ..models.db import commit_now, get_db
+from ..validation.schemas import RefreshIn, RegisterIn, TokenPair, UserOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 _bearer = HTTPBearer(auto_error=False)
