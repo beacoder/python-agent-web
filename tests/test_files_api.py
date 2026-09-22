@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.config import get_settings
+from app.infra.config import get_settings
 
 
 def _setup(client: TestClient) -> tuple[dict, str]:
@@ -119,8 +119,8 @@ class TestFileRoutes:
         assert res.status_code == 404
 
     def test_run_prompt_includes_uploaded_files(self, client: TestClient) -> None:
-        from app.controller import manager as manager_mod
-        from app.controller.runner import ExecResult, Runner
+        from app.controllers import manager as manager_mod
+        from app.controllers.runner import ExecResult, Runner
 
         class CapturingRunner(Runner):
             captured: list[str] = []
