@@ -8,6 +8,7 @@ boot, and startup warns when they are unset.
 """
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -56,6 +57,9 @@ class Settings(BaseSettings):
     access_token_minutes: float = 30.0
     refresh_token_days: float = 14.0
 
+    workspace_root: str = "./workspaces"
+    """Base directory for per-conversation agent workspaces; uploaded
+    files are stored under ``<root>/<conversation_id>/``."""
     runner: str = "server"
     """Sandbox runner: ``server`` (one resident ``harness serve``
     process per sandbox: multi-turn memory, mid-run Q&A, protocol-level
@@ -70,3 +74,19 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def conversation_workspace(conversation_id: str) -> Path:
+    """Per-conversation agent workspace (created on demand).
+
+    Uploaded files are placed here so the agent sees them as plain
+    files in its cwd.  ``PAW_HARNESS__CWD`` still wins when set
+    explicitly (e.g. a shared dev workspace).
+    """
+    settings = get_settings()
+    if settings.harness.cwd:
+        path = Path(settings.harness.cwd)
+    else:
+        path = Path(settings.workspace_root) / conversation_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
