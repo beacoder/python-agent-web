@@ -26,9 +26,13 @@ the agent).
 ┌───────────────▼──────────────────────────────────────┴───────────────┐
 │ FastAPI app  (TRUSTED)                                               │
 │                                                                      │
-│  routes/        auth · conversations(+files, runs, artifacts)        │
+│  routes/        HTTP only: dependencies, status codes, schemas       │
+│                 auth · conversations(+files, runs, artifacts)        │
 │                 billing · secrets                                    │
-│  controllers/   manager.py  run lifecycle, event fan-out (subscribe) │
+│  controllers/   all business logic                                   │
+│    domain       accounts · conversations · files · runs              │
+│                 secrets · usage  (rules, persistence, refusals)      │
+│    machinery    manager.py  run lifecycle, event fan-out (subscribe) │
 │                 protocol.py JSONL line parsing                       │
 │                 runner.py   ServerRunner: one resident harness       │
 │                             process per conversation                 │
@@ -71,14 +75,23 @@ app/
     db.py          SQLite engine/session (SQLAlchemy ORM)
   validation/      (request/response validation)
     schemas.py     Pydantic request/response models
-  routes/          (view layer, HTTP)
+  routes/          (view layer, HTTP only — no business logic)
     auth.py        POST /auth/register /auth/login /auth/refresh /auth/me
     conversations.py  CRUD + POST /{id}/files (upload) + GET/DELETE
                       /{id}/artifacts (agent outputs) + POST /{id}/runs
                       (start) + POST /{id}/answer + GET /{id}/stream (SSE)
     billing.py     usage summary (token ledger)
     secrets.py     CRUD (write-only read: value never returned)
-  controllers/     (business logic)
+  controllers/     (all business logic)
+    errors.py      DomainError hierarchy; main.py renders it as
+                   {"detail": ...} so controllers never mention HTTP
+    accounts.py    register/login rules, token identity, admin check
+    conversations.py  ownership, CRUD, workspace teardown
+    files.py       upload sanitizing + size cap, uploads-vs-artifacts,
+                   traversal-safe artifact paths
+    runs.py        harness prompt augmentation, run access, cancel/answer
+    secrets.py     upsert + encryption-at-rest rules
+    usage.py       token ledger aggregation
     protocol.py    Parse harness event lines (seq/run_id/result/usage)
     manager.py     Controller: start_run, event pump, subscribe, cancel, answer
     runner.py      Runner protocol + ServerRunner (resident serve process,
@@ -124,6 +137,16 @@ delivers the user's reply to a pending mid-run question (the agent's
 Question tool / PlanExit confirm), and cancel is a protocol message —
 no signal semantics.
 
+`notify` lines carry the progress the UI renders, keyed by `kind`:
+`tool_start` (the round's tool names), `tool_calls` (the same round
+with each call's arguments, so a row reads `Bash(command='ls -la')`
+rather than a bare `Bash`), `tool_running`, `tool`, `todos`, `compact`,
+`retry`, `error`, and `ask` for a mid-run question.  `tool_calls` is
+additive — a harness that does not send it degrades to the names from
+`tool_start`.  `log` lines are shown too, except session bookkeeping
+(the generated session title), which says nothing about what the agent
+is doing.
+
 ## Configuration (env, prefix `PAW_`)
 
 | var | default | note |
@@ -141,6 +164,25 @@ no signal semantics.
 
 ## Design notes
 
+- **Routes are thin, controllers own the rules**: a route resolves
+  dependencies, calls a controller, and maps the result to a response
+  schema — nothing else.  No route touches the DB, the filesystem or
+  crypto.  A controller refuses work by raising from
+  `controllers/errors.py` (`NotFound`, `Conflict`, `InvalidRequest`,
+  `PayloadTooLarge`, `Unauthorized`, `Forbidden`); one handler in
+  `main.py` renders that as FastAPI's own `{"detail": ...}` shape with
+  the status the error type carries.  So business logic never imports
+  `HTTPException`, and a controller stays callable from a test, a CLI
+  or a worker thread.
+- **Stateless mechanism vs stateful policy** is the `infra`/
+  `controllers` line, not "core vs supporting".  `infra` holds
+  primitives with no entities and no session — password hashing, JWT,
+  Fernet `encrypt`/`decrypt` — and imports nothing but `infra`.
+  Anything that takes a `Session`, reads or writes an ORM entity, or
+  can refuse a request lives in `controllers`, even for supporting
+  areas like accounts and secrets.  Moving those down would make the
+  bottom layer import `models` and `controllers.errors`, inverting the
+  dependency direction.
 - **Decoupling**: the harness is a black-box binary driven by its
   documented JSONL protocols (the same `start`/`delta`/`notify`/
   `log`/`result` line shapes on the resident `serve` pipe and the
