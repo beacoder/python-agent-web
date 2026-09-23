@@ -8,6 +8,7 @@
 
 The trusted side of an agent platform: API server, controller, auth,
 billing, secrets.
+
 The untrusted side — the agent runtime itself — is
 `python-agent-harness`, executed as a **resident subprocess** per
 sandbox: `python-agent-harness serve`, a bidirectional JSON-lines
