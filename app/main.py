@@ -10,10 +10,12 @@ import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .controllers.errors import DomainError
 from .controllers.manager import get_controller
 from .infra.config import get_settings
 from .models.db import get_engine
@@ -36,6 +38,17 @@ def create_app() -> FastAPI:
             stacklevel=1,
         )
     app = FastAPI(title="python-agent-web", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(DomainError)
+    def _domain_error(_request: Request, exc: DomainError) -> JSONResponse:
+        """Render a controller's refusal in FastAPI's own error shape.
+
+        With this, routes never translate business rules into status
+        codes -- the controller names the failure, the status follows
+        from its type.
+        """
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
     app.include_router(auth.router)
     app.include_router(conversations.router)
     app.include_router(billing.router)
