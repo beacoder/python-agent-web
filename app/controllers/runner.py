@@ -34,6 +34,31 @@ class ExecResult:
     killed: bool = False
 
 
+# How long to wait for a process to be reaped after its stdout closed.
+# Generous: this only runs on the death path, and reporting the real
+# exit code is the whole point of that path.
+_EXIT_REAP_TIMEOUT = 10.0
+
+
+def exit_status(proc: subprocess.Popen, timeout: float = _EXIT_REAP_TIMEOUT) -> int | None:
+    """Exit code of a process whose stdout just reached EOF.
+
+    EOF means the child closed stdout, NOT that it has been reaped, so
+    ``poll()`` here races the child's exit and returns None a good
+    fraction of the time -- reporting a crashed harness as "unknown
+    exit code" and losing the one diagnostic the death path exists to
+    provide.  Waiting collects the real status.
+
+    The wait is bounded because closing stdout does not oblige a
+    process to exit: a child that keeps running must not block the
+    request thread, so that case still degrades to None.
+    """
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return proc.poll()
+
+
 class SandboxNotFoundError(KeyError):
     pass
 
@@ -393,9 +418,12 @@ class ServerRunner(Runner):
             )
             if not saw_result and not timed_out:
                 # EOF without a result line: the process died mid-run
-                # (write success was a race with exit).  Surface death.
+                # (write success was a race with exit).  Surface death,
+                # with the real exit code -- poll() here would race the
+                # child's reaping and often report None (see
+                # exit_status).
                 return ExecResult(
-                    exit_code=proc.poll(),
+                    exit_code=exit_status(proc),
                     stdout="".join(stdout_lines),
                     stderr="".join(list(meta["stderr_log"])[err_from:])
                     or "harness process died mid-run",
