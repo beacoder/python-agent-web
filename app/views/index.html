@@ -95,11 +95,13 @@
   #messages { padding:6px 0 20px; }
   .msg { margin:14px 0; padding:12px 16px; border-radius:12px; white-space:pre-wrap; word-break:break-word; max-width:85%; }
   .msg.user { background:var(--accent-soft); color:var(--fg); margin-left:auto; border:1px solid var(--line); }
-  .msg.agent { background:var(--panel); border:1px solid var(--line); box-shadow:var(--shadow); }
+  .msg.agent { background:transparent; border:0; box-shadow:none; max-width:100%; padding:2px 0; }
   .msg.tool { background:transparent; border:1px dashed var(--line); color:var(--muted); font-family:ui-monospace, monospace; font-size:12px; max-width:100%; }
   .msg.err { background:transparent; border:1px solid var(--err); color:var(--err); max-width:100%; }
   .msg .who { font-size:12px; color:var(--muted); margin-bottom:4px; }
   .msg pre { background:rgba(0,0,0,.05); border-radius:8px; padding:10px; overflow:auto; font-size:12px; }
+  .progress { display:flex; align-items:center; gap:8px; margin:10px 0; font-size:13px; color:var(--muted); }
+  .progress .spin { display:inline-block; animation:spin 1s linear infinite; }
   .artifact { display:inline-flex; align-items:center; gap:6px; background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:5px 14px; font-size:13px; text-decoration:none; color:var(--fg); box-shadow:var(--shadow); }
   .artifact:hover { border-color:var(--accent); color:var(--accent); }
   .artifact .size { color:var(--muted); font-size:11px; }
@@ -334,7 +336,12 @@ async function openConversation(id, title) {
   const box = $('messages'); box.innerHTML = '';
   for (const run of detail.runs) {
     addMsg('user', run.prompt);
-    if (run.answer) addMsg('agent', run.answer);
+    if (run.events && run.events.length) {
+      let agentDiv = null;
+      for (const e of run.events) agentDiv = renderEvent(e, agentDiv, false);
+    } else if (run.answer) {
+      addMsg('agent', run.answer);
+    }
     if (run.error) addMsg('err', run.error);
   }
   loadConversations();
@@ -432,7 +439,6 @@ function addMsg(kind, text) {
   const div = document.createElement('div');
   div.className = 'msg ' + kind;
   if (kind === 'agent') {
-    div.innerHTML = `<div class="who">AI</div>`;
     div.appendChild(renderAnswer(text));
   } else {
     div.textContent = text;
@@ -440,6 +446,29 @@ function addMsg(kind, text) {
   $('messages').appendChild(div);
   $('messages').scrollTop = $('messages').scrollHeight;
   return div;
+}
+function addAgentText() {
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  const span = document.createElement('span');
+  div.appendChild(span);
+  $('messages').appendChild(div);
+  $('messages').scrollTop = $('messages').scrollHeight;
+  return span;
+}
+// One live progress row per tool: tool_running updates it in place,
+// tool_start (a new tool / message boundary) starts a fresh row.
+let liveProgress = null;
+function addProgress(text, busy, fresh = false) {
+  if (!liveProgress || fresh) {
+    const div = document.createElement('div');
+    div.className = 'progress';
+    $('messages').appendChild(div);
+    liveProgress = div;
+  }
+  liveProgress.innerHTML = (busy ? '<span class="spin">⚙️</span>' : '<span>✅</span>') +
+    '<span>' + escapeHtml(text) + '</span>';
+  $('messages').scrollTop = $('messages').scrollHeight;
 }
 function renderAnswer(text) {
   // minimal markdown: code fences + bold
@@ -511,6 +540,86 @@ function strData(d) {
   if (Array.isArray(d)) return d.map(strData).join(', ');
   return JSON.stringify(d);
 }
+// The harness's "tool_calls" payload -> "Bash(command='ls -la')".
+// Each entry is {name, args}; args values arrive pre-formatted and
+// pre-truncated by the harness (repr strings), so they are safe to show
+// verbatim -- addProgress escapes them before they reach the DOM.
+function toolCallLabel(calls) {
+  if (!Array.isArray(calls)) return '';
+  return calls.map(c => toolOneLabel(c)).filter(Boolean).join(', ');
+}
+function toolOneLabel(c) {
+  const name = (c && c.name) || 'tool';
+  const args = (c && typeof c.args === 'object' && c.args) || {};
+  const params = Object.keys(args).map(k => k + '=' + args[k]).join(' ');
+  return params ? name + '(' + params + ')' : name;
+}
+// A tool round reuses ONE progress row (tool_start opens it,
+// tool_running/tool then update it in place), so the command has to be
+// remembered for the row's later states -- otherwise the finished row
+// would read a bare "工具执行完成" and the command would be lost from the
+// transcript.  Reset per round by tool_start.
+let roundLabel = '';
+let roundArgsByName = {};
+// Harness log lines that are bookkeeping rather than progress: the
+// session's generated title says nothing about what the agent is doing.
+const LOG_SKIP = [/^session titled\b/];
+// One harness event (live SSE or stored replay) -> message-flow DOM.
+// Returns the current agent-text span, or null when the event starts a
+// new assistant message (tool_start / retry are message boundaries).
+// live=false (history replay) skips ask/confirm: the run is over, so
+// the answer box would be dead.
+function renderEvent(e, agentDiv, live = true) {
+  if (e.type === 'delta') {
+    if (!agentDiv) agentDiv = addAgentText();
+    agentDiv.textContent += (e.data?.text ?? '');
+    $('messages').scrollTop = $('messages').scrollHeight;
+  } else if (e.type === 'notify' && e.data) {
+    const kind = e.data.kind, data = e.data.data;
+    if (kind === 'tool_start') {
+      agentDiv = null;
+      roundLabel = strData(data);        // names only until tool_calls lands
+      roundArgsByName = {};
+      addProgress('准备执行: ' + roundLabel, true, true);
+    } else if (kind === 'tool_calls') {
+      // Arrives right behind tool_start, naming the same round but with
+      // arguments: upgrade that row in place (no `fresh`) so the user
+      // sees the actual command instead of a bare tool name.
+      const label = toolCallLabel(data);
+      if (label) {
+        roundLabel = label;
+        for (const c of data) {
+          if (c && c.name) roundArgsByName[c.name] = toolOneLabel(c);
+        }
+        addProgress('准备执行: ' + label, true);
+      }
+    } else if (kind === 'tool_running') {
+      const name = strData(data);
+      addProgress('正在执行: ' + (roundArgsByName[name] || name), true);
+    } else if (kind === 'tool') {
+      addProgress(roundLabel ? '完成: ' + roundLabel : '工具执行完成', false);
+    } else if (kind === 'todos') {
+      renderTodos(data);
+    } else if (kind === 'error') {
+      addMsg('err', typeof data === 'string' ? data : JSON.stringify(data));
+    } else if (kind === 'retry') {
+      agentDiv = null;
+      addProgress('模型调用重试中…', true, true);
+    } else if (kind === 'compact') {
+      addProgress('正在压缩上下文…', true);
+    } else if (live && (kind === 'ask' || kind === 'confirm')) {
+      addAsk(data, e.run_id || currentRun);
+    }
+  } else if (e.type === 'log' && e.data && e.data.message) {
+    const msg = String(e.data.message);
+    // Own row (`fresh`): a log line would otherwise overwrite the live
+    // tool row and erase the command the user just saw.  Harness logs
+    // are rare and noteworthy (compaction, MCP, auto-save/agent errors),
+    // so one row each is proportionate.
+    if (!LOG_SKIP.some(re => re.test(msg))) addProgress(msg, true, true);
+  }
+  return agentDiv;
+}
 function setRunStatus(text, busy) {
   const box = $('runStatus');
   if (!text) { box.style.display = 'none'; return; }
@@ -538,32 +647,8 @@ function startStream(runId) {
   let agentDiv = null;
   es.onmessage = ev => {
     const e = JSON.parse(ev.data);
-    if (e.type === 'delta') {
-      if (!agentDiv) agentDiv = addMsg('agent', '');
-      agentDiv.lastChild.textContent = (agentDiv.lastChild.textContent || '') + (e.data?.text ?? '');
-      $('messages').scrollTop = $('messages').scrollHeight;
-    } else if (e.type === 'notify' && e.data) {
-      const kind = e.data.kind, data = e.data.data;
-      if (kind === 'tool_start') {
-        setRunStatus('准备执行: ' + strData(data), true);
-      } else if (kind === 'tool_running') {
-        setRunStatus('正在执行: ' + strData(data), true);
-      } else if (kind === 'tool') {
-        setRunStatus('工具执行完成', true);
-      } else if (kind === 'todos') {
-        renderTodos(data);
-      } else if (kind === 'error') {
-        addMsg('err', typeof data === 'string' ? data : JSON.stringify(data));
-      } else if (kind === 'retry') {
-        setRunStatus('模型调用重试中…', true);
-      } else if (kind === 'compact') {
-        setRunStatus('正在压缩上下文…', true);
-      } else if (kind === 'ask' || kind === 'confirm') {
-        addAsk(data, runId);
-      }
-    } else if (e.type === 'log' && e.data && e.data.message) {
-      setRunStatus(e.data.message, true);
-    } else if (e.type === 'run') {
+    agentDiv = renderEvent(e, agentDiv);
+    if (e.type === 'run') {
       es.close(); es = null; currentRun = null;
       $('stopBtn2').style.display = 'none';
       setRunStatus('', false);
