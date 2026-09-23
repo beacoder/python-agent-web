@@ -93,6 +93,15 @@ class RunAnswer(BaseModel):
     answers: list[str] = Field(min_length=1)
 
 
+class RunEvent(BaseModel):
+    """One harness JSON line, relayed verbatim (plus lifecycle events)."""
+
+    type: str
+    seq: int | None = None
+    run_id: str | None = None
+    data: dict
+
+
 class RunOut(BaseModel):
     id: str
     status: str
@@ -104,15 +113,7 @@ class RunOut(BaseModel):
     duration_ms: int
     created_at: datetime
     finished_at: datetime | None
-
-
-class RunEvent(BaseModel):
-    """One harness JSON line, relayed verbatim (plus lifecycle events)."""
-
-    type: str
-    seq: int | None = None
-    run_id: str | None = None
-    data: dict
+    events: list[RunEvent] = []
 
 
 # --- billing ---
