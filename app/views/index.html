@@ -691,7 +691,7 @@ $('stopBtn').onclick = $('stopBtn2').onclick = async () => {
   await api.req(`/conversations/${currentConv}/runs/${currentRun}/cancel`, { method: 'POST' });
 };
 
-if (api.token) showApp();
+if (api.token) showApp(); else showAuth();
 </script>
 </body>
 </html>
