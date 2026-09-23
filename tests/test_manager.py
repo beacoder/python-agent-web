@@ -105,6 +105,39 @@ class TestStartRun:
         finally:
             db.close()
 
+    def test_harness_prompt_override(self, user_id) -> None:
+        """The Run row keeps the verbatim prompt; the runner gets the
+        augmented harness_prompt (or the prompt when not given)."""
+        uid, cid = user_id
+        runner = StubRunner(stdout=RESULT_OK)
+        controller = _controller(runner)
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(
+                db,
+                user_id=uid,
+                conversation_id=cid,
+                prompt="summarize",
+                harness_prompt="summarize\n\n[Uploaded files: a.xlsx]",
+            )
+            run_id = run.id
+            assert run.prompt == "summarize"
+        finally:
+            db.close()
+        _wait_status(controller, run_id, {"done"})
+        assert runner.last_used[run_id][1] == "summarize\n\n[Uploaded files: a.xlsx]"
+
+        runner2 = StubRunner(stdout=RESULT_OK)
+        controller2 = _controller(runner2)
+        db = get_session_factory()()
+        try:
+            run2 = controller2.start_run(db, user_id=uid, conversation_id=cid, prompt="plain")
+            run2_id = run2.id
+        finally:
+            db.close()
+        _wait_status(controller2, run2_id, {"done"})
+        assert runner2.last_used[run2_id][1] == "plain"
+
     def test_usage_ledger_written(self, user_id) -> None:
         from app.models import Run, UsageEvent
 
