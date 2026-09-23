@@ -74,8 +74,14 @@ class Controller:
         user_id: str,
         conversation_id: str,
         prompt: str,
+        harness_prompt: str | None = None,
     ) -> Run:
-        """Create the Run row, exec the harness on a worker thread."""
+        """Create the Run row, exec the harness on a worker thread.
+
+        ``prompt`` is stored verbatim on the Run row (the UI echoes it);
+        ``harness_prompt`` is what the agent actually receives (the
+        route augments it with file context).  Defaults to ``prompt``.
+        """
         existing = (
             db.query(Run)
             .filter(Run.conversation_id == conversation_id, Run.status == "running")
@@ -108,7 +114,7 @@ class Controller:
             try:
                 result = self._runner.exec_run(
                     sandbox.id,
-                    prompt,
+                    harness_prompt or prompt,
                     run_id,
                     on_line=lambda line: self._on_line(run_id, line),
                     # watchdog: without it a wedged harness (or a
