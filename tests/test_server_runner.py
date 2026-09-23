@@ -10,6 +10,7 @@ contract is covered by the harness repo's own suite (entry/server).
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import textwrap
 import threading
@@ -17,7 +18,7 @@ import time
 
 import pytest
 
-from app.controllers.runner import SandboxNotFoundError, ServerRunner
+from app.controllers.runner import SandboxNotFoundError, ServerRunner, exit_status
 
 # A minimal, protocol-faithful fake of `harness serve`: handles submit
 # (echoes an answer result), answer (acks via a log event), cancel
@@ -491,6 +492,50 @@ class TestReviewFixes:
             assert "died mid-run" in result.stderr
         finally:
             runner.destroy(sandbox)
+
+    def test_death_exit_code_is_not_lost_to_the_reaping_race(self, tmp_path) -> None:
+        """The dead process's exit code must be reported every time.
+
+        EOF on stdout only means the child closed the pipe, not that it
+        has been reaped, so reading the status with ``poll()`` raced the
+        exit and returned None on roughly a quarter of runs -- throwing
+        away the one diagnostic the death path exists to provide.  A
+        single exec could pass that by luck, so this repeats.
+        """
+        script = tmp_path / "exits_with_code.py"
+        script.write_text(
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'type': 'ready', 'pid': 1}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.stdin.readline()  # consume the submit op\n"
+            "sys.exit(9)\n"
+        )
+        seen = set()
+        for _ in range(12):
+            runner = ServerRunner()
+            runner._harness.cmd = f"{sys.executable} {script}"
+            sandbox = runner.create("u", "c")
+            try:
+                seen.add(runner.exec_run(sandbox, "hi", "run_1", timeout=10).exit_code)
+            finally:
+                runner.destroy(sandbox)
+        assert seen == {9}, f"exit code lost to the reaping race: {seen}"
+
+    def test_exit_status_does_not_hang_on_a_process_that_keeps_running(self) -> None:
+        """Closing stdout does not oblige a process to exit, so the wait
+        is bounded: a live child degrades to None instead of blocking
+        the request thread."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE,
+        )
+        try:
+            started = time.time()
+            assert exit_status(proc, timeout=0.5) is None
+            assert time.time() - started < 5  # bounded, not a 30s block
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_stderr_is_captured_and_sliced_per_turn(self, tmp_path) -> None:
         """stderr diagnostics: one per-process drainer feeds a bounded
