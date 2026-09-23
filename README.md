@@ -12,6 +12,7 @@ The untrusted side — the agent runtime itself — is
 `python-agent-harness`, executed as a **resident subprocess** per
 sandbox: `python-agent-harness serve`, a bidirectional JSON-lines
 protocol over stdin/stdout.
+
 The harness is never imported; the repos stay decoupled (the harness
 only needs to be on PATH of whatever runs the agent).
 
@@ -60,6 +61,7 @@ only needs to be on PATH of whatever runs the agent).
 
 Protocol split: **JSONL** is the backend↔harness link (pipes); **SSE**
 is the browser↔backend link.
+
 The controller is a protocol translator — each parsed JSONL line is
 fanned out to in-memory subscribers and re-emitted as an SSE `data:`
 frame, so the browser sees the same events the harness TUI renders (tool
@@ -116,6 +118,7 @@ uvicorn app.main:app --reload    # http://127.0.0.1:8000 (UI at /)
 
 `python-agent-harness` must be importable-on-PATH as a command; point
 `PAW_HARNESS__CMD` at the absolute binary if it is not.
+
 Auth: create a user via `/auth/register`, then log in; the UI does this
 for you.
 
@@ -144,8 +147,10 @@ signal semantics.
 each call's arguments, so a row reads `Bash(command='ls -la')` rather
 than a bare `Bash`), `tool_running`, `tool`, `todos`, `compact`,
 `retry`, `error`, and `ask` for a mid-run question.
+
 `tool_calls` is additive — a harness that does not send it degrades to
 the names from `tool_start`.
+
 `log` lines are shown too, except session bookkeeping (the generated
 session title), which says nothing about what the agent is doing.
 
