@@ -173,6 +173,18 @@ class TestSecretsRoutes:
         )
         assert res.status_code == 422
 
+    def test_body_name_must_match_path(self, client: TestClient, auth_headers: dict) -> None:
+        """Otherwise the write would land on a different secret than the
+        URL names."""
+        res = client.put(
+            "/secrets/WANTED",
+            json={"name": "OTHER", "value": "v"},
+            headers=auth_headers,
+        )
+        assert res.status_code == 400, res.text
+        assert res.json()["detail"] == "name mismatch with path"
+        assert client.get("/secrets", headers=auth_headers).json() == []
+
     def test_isolated_per_user(self, client: TestClient) -> None:
         t1 = client.post(
             "/auth/register", json={"email": "s1@example.com", "password": "password-1"}
