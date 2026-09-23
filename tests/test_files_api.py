@@ -118,12 +118,39 @@ class TestFileRoutes:
         res = client.delete(f"/conversations/{conversation_id}/files/file_nope", headers=headers)
         assert res.status_code == 404
 
+    def test_upload_over_limit_413_and_leaves_no_partial(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The size cap is enforced while streaming, and the partial file
+        is removed -- a half-written upload must not linger in the
+        agent's cwd where it could be mistaken for real input."""
+        from app.controllers import files as files_controller
+
+        monkeypatch.setattr(files_controller, "MAX_UPLOAD_BYTES", 8)
+        headers, conversation_id = _setup(client)
+        res = client.post(
+            f"/conversations/{conversation_id}/files",
+            headers=headers,
+            files={"file": ("big.xlsx", b"x" * 64, "application/octet-stream")},
+        )
+        assert res.status_code == 413, res.text
+        workspace = Path(get_settings().workspace_root) / conversation_id
+        assert list(workspace.iterdir()) == []
+        detail = client.get(f"/conversations/{conversation_id}", headers=headers).json()
+        assert detail["files"] == []
+
+    def test_artifact_empty_name_is_not_a_listing(self, client: TestClient) -> None:
+        """A trailing slash must not be read as "download the workspace"."""
+        headers, conversation_id = _setup(client)
+        res = client.get(f"/conversations/{conversation_id}/artifacts/", headers=headers)
+        assert res.status_code in (307, 400, 404), res.text
+
     def test_run_prompt_includes_uploaded_files(self, client: TestClient) -> None:
         from app.controllers import manager as manager_mod
         from app.controllers.runner import ExecResult, Runner
 
         class CapturingRunner(Runner):
-            captured: list[str] = []
+            captured: list[tuple[str, str]] = []
 
             def create(self, user_id: str, conversation_id: str) -> str:
                 return "sbx_files"
@@ -132,7 +159,7 @@ class TestFileRoutes:
                 pass
 
             def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
-                CapturingRunner.captured.append(prompt)
+                CapturingRunner.captured.append((prompt, run_id))
                 return ExecResult(
                     exit_code=0,
                     stdout='{"type": "result", "answer": "ok", "errors": []}\n',
@@ -165,7 +192,19 @@ class TestFileRoutes:
                     continue
                 break
             assert CapturingRunner.captured, "run never executed"
-            assert "sales.xlsx" in CapturingRunner.captured[0]
+            harness_prompt, run_id = CapturingRunner.captured[0]
+            assert "sales.xlsx" in harness_prompt
+            assert "Save any result files" in harness_prompt
+            # the Run row keeps the user's verbatim prompt, not the
+            # augmented harness prompt (the UI echoes it)
+            from app.models import Run
+            from app.models.db import get_session_factory
+
+            db = get_session_factory()()
+            try:
+                assert db.get(Run, run_id).prompt == "summarize"
+            finally:
+                db.close()
         finally:
             monkeypatched.undo()
 
