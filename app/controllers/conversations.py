@@ -13,9 +13,9 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from ..infra.config import conversation_workspace, get_settings
+from ..infra.db import commit_now
 from ..models import Conversation, ConversationFile, User, new_id
-from ..models.db import commit_now
-from .errors import NotFound
+from .access import get_owned
 
 
 def owned(db: Session, user: User, conversation_id: str) -> Conversation:
@@ -24,10 +24,14 @@ def owned(db: Session, user: User, conversation_id: str) -> Conversation:
     Someone else's conversation is reported missing rather than
     forbidden, so an id cannot be probed for existence.
     """
-    conversation = db.get(Conversation, conversation_id)
-    if conversation is None or conversation.user_id != user.id:
-        raise NotFound("conversation not found")
-    return conversation
+    return get_owned(
+        db,
+        Conversation,
+        conversation_id,
+        owner_field="user_id",
+        owner_value=user.id,
+        detail="conversation not found",
+    )
 
 
 def create(db: Session, user: User, title: str | None) -> Conversation:
