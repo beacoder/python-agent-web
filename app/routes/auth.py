@@ -6,17 +6,32 @@ in ``controllers.accounts``.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from ..controllers import accounts
+from ..controllers.errors import TooManyRequests
+from ..infra.config import get_settings
+from ..infra.db import get_db
+from ..infra.ratelimit import limiter
 from ..models import User
-from ..models.db import get_db
-from ..validation.schemas import RefreshIn, RegisterIn, TokenPair, UserOut
+from ..validation.schemas import PasswordChange, RefreshIn, RegisterIn, TokenPair, UserOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 _bearer = HTTPBearer(auto_error=False)
+
+
+def limit_auth(request: Request) -> None:
+    """Per-IP limit on unauthenticated auth attempts (brute force / signup
+    abuse).  Kept here rather than in ``limits.py`` to avoid an import
+    cycle with ``authenticate_user``."""
+    ip = request.client.host if request.client else "unknown"
+    s = get_settings()
+    allowed, retry_after = limiter.check(f"auth:{ip}", s.rate_limit_auth, s.rate_limit_window_s)
+    if not allowed:
+        secs = int(retry_after) + 1
+        raise TooManyRequests(f"rate limit exceeded; retry in {secs}s", retry_after=secs)
 
 
 def authenticate_user(
@@ -53,12 +68,17 @@ def _user_out(user: User) -> UserOut:
     )
 
 
-@router.post("/register", response_model=TokenPair, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=TokenPair,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(limit_auth)],
+)
 def register(body: RegisterIn, db: Session = Depends(get_db)) -> TokenPair:
     return _token_pair(accounts.register(db, body.email, body.password))
 
 
-@router.post("/login", response_model=TokenPair)
+@router.post("/login", response_model=TokenPair, dependencies=[Depends(limit_auth)])
 def login(body: RegisterIn, db: Session = Depends(get_db)) -> TokenPair:
     return _token_pair(accounts.login(db, body.email, body.password))
 
@@ -71,6 +91,25 @@ def refresh(body: RefreshIn, db: Session = Depends(get_db)) -> TokenPair:
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(authenticate_user)) -> UserOut:
     return _user_out(user)
+
+
+@router.post("/logout")
+def logout(user: User = Depends(authenticate_user), db: Session = Depends(get_db)) -> dict:
+    """Revoke all of the caller's tokens (access + refresh)."""
+    accounts.revoke_all_tokens(db, user)
+    return {"revoked": True}
+
+
+@router.post("/password")
+def change_password(
+    body: PasswordChange,
+    user: User = Depends(authenticate_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Change password (verifying the current one) and revoke existing
+    sessions."""
+    accounts.change_password(db, user, body.old_password, body.new_password)
+    return {"changed": True}
 
 
 @router.get("/admin-check")
