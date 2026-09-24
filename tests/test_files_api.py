@@ -197,8 +197,8 @@ class TestFileRoutes:
             assert "Save any result files" in harness_prompt
             # the Run row keeps the user's verbatim prompt, not the
             # augmented harness prompt (the UI echoes it)
+            from app.infra.db import get_session_factory
             from app.models import Run
-            from app.models.db import get_session_factory
 
             db = get_session_factory()()
             try:
