@@ -39,8 +39,9 @@ only needs to be on PATH of whatever runs the agent).
 │                 protocol.py JSONL line parsing                       │
 │                 runner.py   ServerRunner: one resident harness       │
 │                             process per conversation                 │
-│  infra/         config (PAW_* env) · security (JWT, Fernet)          │
-│  models/        SQLite (SQLAlchemy): users, conversations, runs,     │
+│  infra/         config (PAW_* env) · db (engine + migrations) ·      │
+│                 security (JWT, Fernet)                               │
+│  models/        ORM entities: users, conversations, runs,            │
 │                 files, usage ledger, secrets, sandboxes              │
 └───────────────┬──────────────────────────────────────────────────────┘
                 │ stdin/stdout pipes — bidirectional JSONL
@@ -68,47 +69,6 @@ fanned out to in-memory subscribers and re-emitted as an SSE `data:`
 frame, so the browser sees the same events the harness TUI renders (tool
 progress, todos, errors, mid-run questions).
 
-## Layout
-
-```
-app/
-  main.py          FastAPI app factory + routers + static UI
-  models/          (model layer)
-    __init__.py    ORM models: User, Conversation, ConversationFile, Run,
-                   UsageEvent, Secret, Sandbox
-    db.py          SQLite engine/session (SQLAlchemy ORM)
-  validation/      (request/response validation)
-    schemas.py     Pydantic request/response models
-  routes/          (view layer, HTTP only — no business logic)
-    auth.py        POST /auth/register /auth/login /auth/refresh /auth/me
-    conversations.py  CRUD + POST /{id}/files (upload) + GET/DELETE
-                      /{id}/artifacts (agent outputs) + POST /{id}/runs
-                      (start) + POST /{id}/answer + GET /{id}/stream (SSE)
-    billing.py     usage summary (token ledger)
-    secrets.py     CRUD (write-only read: value never returned)
-  controllers/     (all business logic)
-    errors.py      DomainError hierarchy; main.py renders it as
-                   {"detail": ...} so controllers never mention HTTP
-    accounts.py    register/login rules, token identity, admin check
-    conversations.py  ownership, CRUD, workspace teardown
-    files.py       upload sanitizing + size cap, uploads-vs-artifacts,
-                   traversal-safe artifact paths
-    runs.py        harness prompt augmentation, run access, cancel/answer
-    secrets.py     upsert + encryption-at-rest rules
-    usage.py       token ledger aggregation
-    protocol.py    Parse harness event lines (seq/run_id/result/usage)
-    manager.py     Controller: start_run, event pump, subscribe, cancel, answer
-    runner.py      Runner protocol + ServerRunner (resident serve process,
-                   per-conversation workspace cwd)
-  views/           (static UI)
-    index.html     Chat UI: upload, task cards, SSE progress (tool status,
-                   todos, ask/answer), artifact downloads
-  infra/           (cross-cutting infrastructure)
-    config.py      Settings (pydantic-settings, env prefix PAW_)
-    security.py    JWT auth (access/refresh) + password hashing
-    secrets_store.py  Fernet-encrypted secret values
-```
-
 ## Quick start
 
 ```bash
@@ -122,6 +82,26 @@ uvicorn app.main:app --reload    # http://127.0.0.1:8000 (UI at /)
 
 Auth: create a user via `/auth/register`, then log in; the UI does this
 for you.
+
+### Database & migrations
+
+The schema is owned by Alembic (`migrations/`). Startup runs
+`upgrade_to_head()` automatically, so a fresh `uvicorn` run creates the
+schema and stamps `alembic_version` — no manual step for dev. Tests
+migrate each throwaway database the same way, so the whole suite runs
+against real migrations.
+
+After changing a model, generate and review a migration:
+
+```bash
+alembic revision --autogenerate -m "describe the change"   # writes migrations/versions/*
+alembic upgrade head                                        # apply it
+alembic check                                               # models ⇆ migrations in sync
+```
+
+`alembic check` reporting "No new upgrade operations detected" means the
+migrations match the models. SQLite uses batch mode for ALTERs; the
+migration URL comes from `PAW_DB_URL` (see `migrations/env.py`).
 
 ## The serve protocol (harness side)
 
@@ -212,3 +192,14 @@ session title), which says nothing about what the agent is doing.
 - **Billing** is a token ledger: the controller snapshots `result.usage`
   (input/output/rounds) from the harness into `usage_events`, attributed
   to the user and conversation.
+- **Observability**: every request gets an `X-Request-ID` (echoed if the
+  client sent one), bound to a contextvar so every `paw.*` log line
+  carries it; unhandled errors are logged with a traceback and returned
+  as a 500 quoting the id. `PAW_LOG_JSON=true` switches to JSON lines.
+- **Rate limiting**: a process-local sliding-window limiter throttles the
+  run endpoint per user (each run spends tokens) and login/register per
+  IP, returning 429 + `Retry-After`. Per-instance only — a multi-instance
+  deploy would need a shared store.
+- **Token revocation**: tokens carry a `ver` claim matched against the
+  user's `token_version`; logout and password change bump it, so every
+  outstanding token (all sessions) is rejected on next use.
