@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
+from app.infra.db import get_session_factory
 from app.models import Run, new_id
-from app.models.db import get_session_factory
 
 
 def _utcnow() -> datetime:
@@ -230,8 +230,8 @@ class TestSecretsRoutes:
         import tempfile
 
         from app.infra.config import get_settings
+        from app.infra.db import get_session_factory
         from app.models import User
-        from app.models.db import get_session_factory
 
         db = get_session_factory()()
         try:
@@ -252,8 +252,8 @@ class TestSecretsRoutes:
 
     def test_decrypt_roundtrip(self, client: TestClient, auth_headers: dict) -> None:
         from app.infra import secrets_store
+        from app.infra.db import get_session_factory
         from app.models import Secret
-        from app.models.db import get_session_factory
 
         client.put("/secrets/KEY", json={"name": "KEY", "value": "plain"}, headers=auth_headers)
         db = get_session_factory()()
@@ -277,8 +277,8 @@ class TestBillingRoutes:
         }
 
     def test_summary_after_run(self, client: TestClient, auth_headers: dict) -> None:
+        from app.infra.db import get_session_factory
         from app.models import Conversation, UsageEvent, new_id
-        from app.models.db import get_session_factory
 
         conversation_id = client.post(
             "/conversations", json={"title": "bill"}, headers=auth_headers
