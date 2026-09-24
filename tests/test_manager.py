@@ -9,8 +9,8 @@ import pytest
 
 from app.controllers.manager import Controller
 from app.controllers.runner import ExecResult, Runner, SandboxNotFoundError
+from app.infra.db import get_session_factory
 from app.models import Conversation, User, new_id
-from app.models.db import get_session_factory
 
 
 @dataclass
@@ -339,8 +339,8 @@ def test_phantom_finalize_when_row_missing() -> None:
     controller = mgr.Controller(runner=NullRunner())
     # do NOT create the Run row; directly invoke _finish_run
     controller._finish_run("run_phantom", RunOutcome(errors=["orphaned"], exit_code=1))
+    from app.infra.db import get_session_factory
     from app.models import Run
-    from app.models.db import get_session_factory
 
     db = get_session_factory()()
     try:
@@ -386,3 +386,126 @@ def test_queue_disconnect_mid_run(user_id) -> None:
     time.sleep(0.3)
     with controller._lock:
         assert run_id not in controller._active
+
+
+class TestOneRunningRunConstraint:
+    """The partial unique index — not just the Python pre-check —
+    guarantees at most one running run per conversation."""
+
+    def _running_run(self, cid: str):
+        from app.models import Run
+
+        return Run(id=new_id("run"), conversation_id=cid, prompt="p", status="running")
+
+    def test_second_running_run_is_rejected_by_the_db(self, user_id) -> None:
+        from sqlalchemy.exc import IntegrityError
+
+        _uid, cid = user_id
+        db = get_session_factory()()
+        try:
+            db.add(self._running_run(cid))
+            db.commit()
+            db.add(self._running_run(cid))  # same conversation, also running
+            with pytest.raises(IntegrityError):
+                db.commit()
+        finally:
+            db.rollback()
+            db.close()
+
+    def test_new_running_run_allowed_once_the_previous_finished(self, user_id) -> None:
+        _uid, cid = user_id
+        db = get_session_factory()()
+        try:
+            first = self._running_run(cid)
+            db.add(first)
+            db.commit()
+            first.status = "done"  # finished -> no longer indexed
+            db.commit()
+            db.add(self._running_run(cid))
+            db.commit()  # must not raise
+        finally:
+            db.close()
+
+    def test_two_conversations_can_each_have_a_running_run(self, user_id) -> None:
+        uid, cid = user_id
+        db = get_session_factory()()
+        try:
+            other = Conversation(id=new_id("cnv"), user_id=uid, title="t2")
+            db.add(other)
+            db.commit()
+            db.add(self._running_run(cid))
+            db.add(self._running_run(other.id))
+            db.commit()  # different conversations -> both allowed
+        finally:
+            db.close()
+
+
+class TestOrphanRunSweep:
+    """A restart abandons in-flight runs; startup must fail the stranded
+    ``running`` rows so they don't hang forever or block the conversation."""
+
+    def test_orphaned_running_run_is_marked_error(self, user_id) -> None:
+        from app.models import Run
+
+        _uid, cid = user_id
+        db = get_session_factory()()
+        try:
+            db.add(Run(id="run_orphan", conversation_id=cid, prompt="p", status="running"))
+            db.commit()
+        finally:
+            db.close()
+
+        n = _controller(StubRunner()).reconcile_orphaned_runs()
+        assert n == 1
+
+        db = get_session_factory()()
+        try:
+            from app.models import Run
+
+            run = db.get(Run, "run_orphan")
+            assert run.status == "error"
+            assert "restart" in run.error
+            assert run.finished_at is not None
+        finally:
+            db.close()
+
+    def test_sweep_leaves_finished_runs_untouched(self, user_id) -> None:
+        from app.models import Run
+
+        _uid, cid = user_id
+        db = get_session_factory()()
+        try:
+            db.add(Run(id="run_done", conversation_id=cid, prompt="p", status="done", answer="a"))
+            db.commit()
+        finally:
+            db.close()
+
+        assert _controller(StubRunner()).reconcile_orphaned_runs() == 0
+
+        db = get_session_factory()()
+        try:
+            assert db.get(Run, "run_done").status == "done"
+        finally:
+            db.close()
+
+    def test_swept_conversation_can_start_a_new_run(self, user_id) -> None:
+        """After the sweep clears the orphan, the partial unique index no
+        longer blocks a fresh run for that conversation."""
+        from app.models import Run
+
+        uid, cid = user_id
+        db = get_session_factory()()
+        try:
+            db.add(Run(id="run_stuck", conversation_id=cid, prompt="p", status="running"))
+            db.commit()
+        finally:
+            db.close()
+
+        controller = _controller(StubRunner(stdout=RESULT_OK))
+        controller.reconcile_orphaned_runs()
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="fresh")
+        finally:
+            db.close()
+        _wait_status(controller, run.id, {"done"})
