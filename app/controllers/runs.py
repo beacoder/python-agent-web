@@ -14,8 +14,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ..models import Conversation, ConversationFile, Run
+from .access import get_owned
 from .conversations import files_of
-from .errors import Conflict, NotFound
+from .errors import Conflict
 from .manager import Controller
 
 # Told to the agent, not to the user: the sandbox cwd is the only place
@@ -67,10 +68,14 @@ def start(
 
 def of_conversation(db: Session, conversation: Conversation, run_id: str) -> Run:
     """A run belonging to this conversation, or NotFound."""
-    run = db.get(Run, run_id)
-    if run is None or run.conversation_id != conversation.id:
-        raise NotFound("run not found")
-    return run
+    return get_owned(
+        db,
+        Run,
+        run_id,
+        owner_field="conversation_id",
+        owner_value=conversation.id,
+        detail="run not found",
+    )
 
 
 def cancel(controller: Controller, run_id: str) -> bool:
