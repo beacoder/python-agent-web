@@ -17,13 +17,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..infra.config import get_settings
+from ..infra.db import get_session_factory
+from ..infra.logging import get_logger
 from ..models import Conversation, Run, Sandbox, UsageEvent, new_id
-from ..models.db import get_session_factory
 from .protocol import RunOutcome, apply_event, parse_line
 from .runner import Runner, SandboxNotFoundError, get_runner
+
+_log = get_logger("run")
 
 
 @dataclass
@@ -82,6 +86,9 @@ class Controller:
         ``harness_prompt`` is what the agent actually receives (the
         route augments it with file context).  Defaults to ``prompt``.
         """
+        # Fast, friendly pre-check; the partial unique index on runs is
+        # the authoritative guard (below) since this check-then-insert
+        # otherwise races a concurrent submit.
         existing = (
             db.query(Run)
             .filter(Run.conversation_id == conversation_id, Run.status == "running")
@@ -101,8 +108,13 @@ class Controller:
         db.add(run)
         # Commit now: the worker thread finalizes the row from its own
         # session, so the "running" state must be durable before the
-        # harness process is spawned.
-        db.commit()
+        # harness process is spawned.  A concurrent submit that won the
+        # race trips the unique index here -> reject this one.
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise RuntimeError("conversation already has a running run") from exc
         run_id = run.id
 
         active = ActiveRun(run_id=run_id, sandbox_id=sandbox.id)
@@ -111,6 +123,7 @@ class Controller:
 
         def _worker() -> None:
             started = time.time()
+            _log.info("run %s started (conversation %s)", run_id, conversation_id)
             try:
                 result = self._runner.exec_run(
                     sandbox.id,
@@ -122,9 +135,11 @@ class Controller:
                     timeout=get_settings().harness.timeout,
                 )
             except SandboxNotFoundError as exc:
+                _log.warning("run %s: sandbox gone: %s", run_id, exc)
                 self._finish_run(run_id, RunOutcome(errors=[f"sandbox gone: {exc}"], duration_ms=0))
                 return
             except Exception as exc:  # worker must always finish the run row
+                _log.exception("run %s: runner error", run_id)
                 self._finish_run(run_id, RunOutcome(errors=[f"runner error: {exc}"], duration_ms=0))
                 return
             outcome = RunOutcome(exit_code=result.exit_code)
@@ -223,82 +238,81 @@ class Controller:
             q.put(payload)
 
     def _finish_run(self, run_id: str, outcome: RunOutcome) -> None:
-        """Persist terminal state from the worker thread.
+        """Persist terminal state, then notify subscribers.
 
-        The Run row is created on the request thread's session (which
-        commits when the request succeeds), so the worker may reach
-        this point before that commit lands.  Retry briefly on a
-        missing row, then finalize with an always-committed session —
-        a lost terminal state is worse than a short wait.
+        Orchestration only: the persistence details live in
+        ``_write_terminal_run`` below.  The subscriber notify/cleanup
+        runs in a ``finally`` so a DB failure can't strand a waiting SSE
+        client on a run that is really over.
         """
-        factory = get_session_factory()
-        deadline = time.time() + 10
-        db = factory()
         final_state = run_status(outcome)
+        events = self._events_snapshot(run_id)
+        if outcome.errors:
+            _log.warning("run %s finished: %s — %s", run_id, final_state, "; ".join(outcome.errors))
+        else:
+            _log.info("run %s finished: %s (%dms)", run_id, final_state, outcome.duration_ms)
         try:
-            while True:
-                run = db.get(Run, run_id)
-                if run is not None:
-                    break
-                if time.time() >= deadline:
-                    run = Run(  # phantom finalize: preserve the outcome
-                        id=run_id,
-                        conversation_id=_phantom_conversation(db),
-                        prompt="",
-                        status=final_state,
-                        error="run row missing (request never committed?)",
-                    )
-                    db.add(run)
-                    break
-                db.rollback()
-                time.sleep(0.02)
-            run.status = final_state
-            run.answer = outcome.answer
-            run.error = "\n".join(outcome.errors)
-            run.exit_code = outcome.exit_code
-            run.cancelled = outcome.cancelled
-            run.finished_at = _now()
-            if outcome.duration_ms:
-                run.duration_ms = outcome.duration_ms
-            with self._lock:
-                active = self._active.get(run_id)
-            if active is not None:
-                with active.lock:
-                    run.events = list(active.seen)
-            usage = outcome.usage
-            if usage is not None:
-                owner = (
-                    db.query(Conversation.user_id)
-                    .filter(Conversation.id == run.conversation_id)
-                    .scalar()
-                    or ""
-                )
-                db.add(
-                    UsageEvent(
-                        id=new_id("use"),
-                        user_id=owner,
-                        conversation_id=run.conversation_id,
-                        run_id=run_id,
-                        input_tokens=int(usage.get("input", 0) or 0),
-                        output_tokens=int(usage.get("output", 0) or 0),
-                        rounds=int(usage.get("rounds", 0) or 0),
-                        model=str(outcome.model or ""),
-                    )
-                )
-            db.commit()
+            with get_session_factory()() as db:
+                _write_terminal_run(db, run_id, outcome, final_state, events)
+                db.commit()
         finally:
-            db.close()
-            with self._lock:
-                active = self._active.pop(run_id, None)
-            if active is not None:
-                with active.lock:
-                    final = {"type": "run", "state": final_state}
-                    active.seen.append(final)
-                    subscribers = list(active.subscribers)
-                for q in subscribers:
-                    q.put(final)
+            self._close_active(run_id, final_state)
+
+    def _events_snapshot(self, run_id: str) -> list[dict[str, Any]] | None:
+        """A copy of the run's seen events, or None if it isn't active.
+
+        Taken before the DB write so the stored ``run.events`` excludes
+        the terminal ``run`` event (that one is appended at replay time).
+        """
+        with self._lock:
+            active = self._active.get(run_id)
+        if active is None:
+            return None
+        with active.lock:
+            return list(active.seen)
+
+    def _close_active(self, run_id: str, final_state: str) -> None:
+        """Drop the active run and push the terminal event to subscribers."""
+        with self._lock:
+            active = self._active.pop(run_id, None)
+        if active is None:
+            return
+        with active.lock:
+            final = {"type": "run", "state": final_state}
+            active.seen.append(final)
+            subscribers = list(active.subscribers)
+        for q in subscribers:
+            q.put(final)
 
     # -- reaper ------------------------------------------------------------
+
+    def reconcile_orphaned_runs(self) -> int:
+        """Fail runs left ``running`` by a previous process (startup only).
+
+        Runs execute on in-process daemon threads, so a restart abandons
+        any in-flight run while its row still says ``running`` — stranding
+        it forever and (via the partial unique index) blocking the
+        conversation from starting a new one.  At startup ``_active`` is
+        empty, so every ``running`` row is orphaned: mark them ``error``.
+        Returns the number reconciled.
+        """
+        with get_session_factory()() as db:
+            n = (
+                db.query(Run)
+                .filter(Run.status == "running")
+                .update(
+                    {
+                        Run.status: "error",
+                        Run.error: "interrupted by server restart",
+                        Run.finished_at: _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+        if n:
+            _log.warning("reconciled %d orphaned run(s) to error on startup", n)
+        return n
 
     def reap_idle_sandboxes(self) -> list[str]:
         destroyed = self._runner.reap_idle(get_settings().sandbox.ttl_seconds)
@@ -317,6 +331,80 @@ class Controller:
 
 def run_status(outcome: RunOutcome) -> str:
     return "cancelled" if outcome.cancelled else ("error" if outcome.errors else "done")
+
+
+def _write_terminal_run(
+    db: Session,
+    run_id: str,
+    outcome: RunOutcome,
+    final_state: str,
+    events: list[dict[str, Any]] | None,
+) -> None:
+    """Write the run's terminal state (and usage) into the DB.
+
+    Pure persistence — no threads, no subscribers.  ``events`` is the
+    seen-event snapshot to store, or None when the run wasn't active.
+    """
+    run = _resolve_run_row(db, run_id, final_state)
+    run.status = final_state
+    run.answer = outcome.answer
+    run.error = "\n".join(outcome.errors)
+    run.exit_code = outcome.exit_code
+    run.cancelled = outcome.cancelled
+    run.finished_at = _now()
+    if outcome.duration_ms:
+        run.duration_ms = outcome.duration_ms
+    if events is not None:
+        run.events = events
+    if outcome.usage is not None:
+        _record_usage(db, run, outcome)
+
+
+def _resolve_run_row(db: Session, run_id: str, final_state: str, timeout_s: float = 10) -> Run:
+    """Fetch the Run row, waiting briefly for the request thread's commit.
+
+    The row is created on the request thread's session and committed
+    when that request succeeds, so the worker can arrive here first.
+    Retry briefly; past the deadline, synthesize a phantom row so a
+    terminal state is never silently lost.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        run = db.get(Run, run_id)
+        if run is not None:
+            return run
+        if time.time() >= deadline:
+            run = Run(
+                id=run_id,
+                conversation_id=_phantom_conversation(db),
+                prompt="",
+                status=final_state,
+                error="run row missing (request never committed?)",
+            )
+            db.add(run)
+            return run
+        db.rollback()
+        time.sleep(0.02)
+
+
+def _record_usage(db: Session, run: Run, outcome: RunOutcome) -> None:
+    """Append a token-ledger row for the run, attributed to its owner."""
+    usage = outcome.usage or {}
+    owner = (
+        db.query(Conversation.user_id).filter(Conversation.id == run.conversation_id).scalar() or ""
+    )
+    db.add(
+        UsageEvent(
+            id=new_id("use"),
+            user_id=owner,
+            conversation_id=run.conversation_id,
+            run_id=run.id,
+            input_tokens=int(usage.get("input", 0) or 0),
+            output_tokens=int(usage.get("output", 0) or 0),
+            rounds=int(usage.get("rounds", 0) or 0),
+            model=str(outcome.model or ""),
+        )
+    )
 
 
 def _phantom_conversation(db: Session) -> str:
