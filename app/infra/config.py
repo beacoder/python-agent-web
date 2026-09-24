@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     cors_origins: list[str] = []
     """Extra allowed CORS origins for a split frontend."""
 
+    log_level: str = "INFO"
+    """Root level for the ``paw`` logger tree."""
+    log_json: bool = False
+    """Emit one JSON object per log line (for log shippers) vs. text."""
+
+    rate_limit_window_s: float = 60.0
+    """Sliding window for rate limits (seconds)."""
+    rate_limit_runs: int = 20
+    """Max run submissions per user per window (the cost-incurring path)."""
+    rate_limit_auth: int = 10
+    """Max login/register attempts per client IP per window."""
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
