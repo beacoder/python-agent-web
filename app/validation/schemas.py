@@ -38,12 +38,37 @@ class RefreshIn(BaseModel):
     refresh_token: str
 
 
+class PasswordChange(BaseModel):
+    old_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class UserOut(BaseModel):
     id: str
     email: str
     is_active: bool
     is_admin: bool
     created_at: datetime
+
+
+class AccountProfile(BaseModel):
+    """Everything the account dropdown and 个人中心 page need, in one read.
+
+    ``points`` is the sum of ``plan_points`` and ``pack_points`` (never
+    stored separately); ``points_expire_at`` is null for 无有效期.
+    ``works`` is the user's conversation count (the app's "创作").
+    ``name`` has no column yet — it is derived from the email.
+    """
+
+    name: str
+    email: str
+    plan: str
+    phone: str | None
+    points: int
+    plan_points: int
+    pack_points: int
+    points_expire_at: datetime | None
+    works: int
 
 
 # --- conversations ---
