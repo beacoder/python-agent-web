@@ -59,3 +59,17 @@ class PayloadTooLarge(DomainError):
     """Upload exceeds the configured limit (413)."""
 
     status_code = 413
+
+
+class TooManyRequests(DomainError):
+    """Rate limit exceeded (429).
+
+    ``retry_after`` (seconds) is surfaced as a ``Retry-After`` header by
+    the app's error handler.
+    """
+
+    status_code = 429
+
+    def __init__(self, detail: str, retry_after: int = 1) -> None:
+        super().__init__(detail)
+        self.retry_after = retry_after
