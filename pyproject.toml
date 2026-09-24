@@ -14,6 +14,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "sqlalchemy>=2.0",
+    "alembic>=1.13",
     "pydantic-settings>=2.0",
     "pyjwt>=2.8",
     "cryptography>=42.0",
@@ -36,6 +37,9 @@ include = ["app*"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Alembic-generated migration scripts follow the tool's own template
+# (old-style typing, its import order); env.py is hand-written and stays linted.
+extend-exclude = ["migrations/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
