@@ -12,8 +12,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..infra import secrets_store
+from ..infra.db import commit_now
 from ..models import Secret, User, new_id
-from ..models.db import commit_now
 from .errors import InvalidRequest, NotFound
 
 
