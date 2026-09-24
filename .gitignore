@@ -8,6 +8,7 @@ htmlcov/
 *.db
 *.db-shm
 *.db-wal
+.nfs*
 workspaces/
 .env
 .venv/
