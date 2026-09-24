@@ -1,22 +1,25 @@
-"""Database engine/session and startup schema creation.
+"""Database engine/session and schema management.
 
-For the first milestone this is plain SQLAlchemy 2.0 with
-``create_all`` (dev-friendly).  Migrations (alembic) come when the
-schema stabilizes; SQLite is the default and Postgres is the prod
-target — nothing here is SQLite-specific.
+Schema is owned by Alembic migrations (``migrations/``), applied with
+``upgrade_to_head`` on startup and in tests — so dev, test, and prod all
+build the schema the same way.  SQLite is the default; Postgres is the
+prod target, and nothing here is SQLite-specific.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from ..infra.config import get_settings
-from . import Base
+from .config import get_settings
+
+# repo root holds alembic.ini + migrations/ (app/infra/db.py -> parents[2])
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def make_engine(db_url: str | None = None) -> Engine:
@@ -37,6 +40,21 @@ def make_engine(db_url: str | None = None) -> Engine:
     return engine
 
 
+def upgrade_to_head() -> None:
+    """Bring the configured database up to the latest migration.
+
+    Idempotent: Alembic applies only revisions not yet recorded in the
+    ``alembic_version`` table.  The migration URL comes from settings
+    (see ``migrations/env.py``), so this always targets the app's DB.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(_REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(_REPO_ROOT / "migrations"))
+    command.upgrade(cfg, "head")
+
+
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
 
@@ -45,7 +63,7 @@ def get_engine() -> Engine:
     global _engine
     if _engine is None:
         _engine = make_engine()
-        Base.metadata.create_all(_engine)
+        upgrade_to_head()
     return _engine
 
 
@@ -85,9 +103,10 @@ def commit_now(db: Session) -> None:
 
 
 def reset_engine_for_tests(db_url: str) -> Engine:
-    """Point the module-level singletons at a fresh (test) database."""
+    """Point the module-level singletons at a fresh (test) database and
+    migrate it to head — the same schema path the app uses."""
     global _engine, _session_factory
     _engine = make_engine(db_url)
-    Base.metadata.create_all(_engine)
+    upgrade_to_head()
     _session_factory = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine
