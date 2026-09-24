@@ -4,131 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Excel Agent</title>
-<style>
-  :root {
-    --bg: #f7f6f3;
-    --panel: #ffffff;
-    --fg: #1f2328;
-    --muted: #8a8f98;
-    --line: #e8e6e1;
-    --accent: #f97316;
-    --accent-soft: #fff1e7;
-    --accent-fg: #ffffff;
-    --err: #e5484d;
-    --shadow: 0 2px 12px rgba(31, 35, 40, .06);
-  }
-  html[data-theme="dark"] {
-    --bg: #14161a;
-    --panel: #1d2025;
-    --fg: #e6e8eb;
-    --muted: #8b93a1;
-    --line: #2a2e37;
-    --accent-soft: #33261b;
-    --shadow: 0 2px 12px rgba(0, 0, 0, .35);
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--fg); }
-  button { font:inherit; cursor:pointer; }
-
-  /* ---------- top nav ---------- */
-  #topnav { height:56px; display:flex; align-items:center; gap:28px; padding:0 24px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
-  #topnav .logo { display:flex; align-items:center; gap:8px; font-weight:700; font-size:16px; color:var(--accent); }
-  #topnav .logo .mark { width:26px; height:26px; border-radius:7px; background:var(--accent); color:#fff; display:grid; place-items:center; font-size:13px; font-weight:800; }
-  #topnav nav { display:flex; gap:22px; margin:0 auto; }
-  #topnav nav a { color:var(--muted); text-decoration:none; font-size:14px; }
-  #topnav nav a.active { color:var(--accent); font-weight:600; }
-  #topnav .right { display:flex; align-items:center; gap:12px; }
-  #topnav .icon-btn { border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:999px; padding:4px 12px; font-size:13px; }
-  #topnav .user { display:flex; align-items:center; gap:8px; font-size:13px; }
-  #topnav .avatar { width:28px; height:28px; border-radius:50%; background:var(--accent-soft); color:var(--accent); display:grid; place-items:center; font-weight:700; }
-
-  /* ---------- layout ---------- */
-  #app { display:none; }
-  #shell { display:flex; height:calc(100vh - 56px); }
-  #sidebar { width:230px; flex:none; border-right:1px solid var(--line); background:var(--bg); display:flex; flex-direction:column; }
-  #sidebar .head { display:flex; align-items:center; justify-content:space-between; padding:14px 14px 8px; color:var(--accent); font-size:13px; font-weight:600; }
-  #sidebar .head button { border:0; background:none; color:var(--accent); font-size:18px; line-height:1; }
-  #convList { flex:1; overflow:auto; padding:4px 8px; }
-  #convList .empty { color:var(--muted); font-size:13px; padding:12px; }
-  #convList .cnv { padding:9px 12px; border-radius:8px; cursor:pointer; color:var(--muted); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; align-items:center; gap:8px; }
-  #convList .cnv:hover { background:var(--accent-soft); }
-  #convList .cnv.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
-  #convList .cnv .del { margin-left:auto; visibility:hidden; color:var(--muted); font-size:12px; }
-  #convList .cnv:hover .del { visibility:visible; }
-
-  #main { flex:1; overflow:auto; }
-  .wrap { max-width:980px; margin:0 auto; padding:28px 24px 60px; }
-
-  /* ---------- hero ---------- */
-  #hero { text-align:center; padding:26px 0 8px; }
-  #hero h1 { margin:0 0 10px; font-size:30px; font-weight:800; color:var(--accent); letter-spacing:1px; }
-  #hero p { margin:0 auto; max-width:640px; color:var(--muted); font-size:14px; }
-
-  /* ---------- composer card ---------- */
-  .composer { background:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); margin-top:22px; overflow:hidden; }
-  .composer .label { display:flex; align-items:center; gap:6px; padding:12px 18px 0; font-size:13px; color:var(--muted); }
-  .composer textarea { width:100%; min-height:150px; max-height:320px; resize:vertical; border:0; outline:0; background:transparent; color:var(--fg); font:inherit; padding:10px 18px; }
-  .composer .bar { display:flex; align-items:center; gap:10px; padding:10px 14px; border-top:1px solid var(--line); }
-  .composer .bar .spacer { flex:1; }
-  .chip { display:inline-flex; align-items:center; gap:6px; background:var(--accent-soft); color:var(--accent); border-radius:999px; padding:3px 10px; font-size:12px; }
-  .chip .x { cursor:pointer; font-weight:700; }
-  .attach-btn { border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:10px; padding:6px 12px; font-size:13px; display:inline-flex; align-items:center; gap:6px; }
-  .attach-btn:hover { border-color:var(--accent); color:var(--accent); }
-  #sendBtn { background:var(--accent); color:var(--accent-fg); border:0; border-radius:10px; padding:8px 20px; font-size:14px; font-weight:600; display:inline-flex; align-items:center; gap:8px; }
-  #sendBtn:disabled { opacity:.5; cursor:default; }
-  .stop-btn { background:transparent; color:var(--muted); border:1px solid var(--line); border-radius:10px; padding:8px 16px; display:none; }
-  .count { color:var(--muted); font-size:12px; padding:0 18px 8px; text-align:right; }
-
-  /* ---------- task type cards ---------- */
-  #tasks { margin-top:34px; }
-  #tasks .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }
-  #tasks .head h2 { margin:0; font-size:17px; font-weight:700; }
-  #tasks .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:14px; }
-  .task { background:var(--panel); border:2px solid var(--line); border-radius:14px; overflow:hidden; cursor:pointer; box-shadow:var(--shadow); text-align:left; padding:0; }
-  .task:hover { border-color:var(--accent); }
-  .task .thumb { height:84px; display:grid; place-items:center; font-size:34px; background:linear-gradient(135deg, var(--accent-soft), var(--panel)); }
-  .task .name { padding:8px 12px; font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px; }
-  .task .name::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--accent); }
-
-  /* ---------- chat ---------- */
-  #chat { display:none; }
-  #messages { padding:6px 0 20px; }
-  .msg { margin:14px 0; padding:12px 16px; border-radius:12px; white-space:pre-wrap; word-break:break-word; max-width:85%; }
-  .msg.user { background:var(--accent-soft); color:var(--fg); margin-left:auto; border:1px solid var(--line); }
-  .msg.agent { background:transparent; border:0; box-shadow:none; max-width:100%; padding:2px 0; }
-  .msg.tool { background:transparent; border:1px dashed var(--line); color:var(--muted); font-family:ui-monospace, monospace; font-size:12px; max-width:100%; }
-  .msg.err { background:transparent; border:1px solid var(--err); color:var(--err); max-width:100%; }
-  .msg .who { font-size:12px; color:var(--muted); margin-bottom:4px; }
-  .msg pre { background:rgba(0,0,0,.05); border-radius:8px; padding:10px; overflow:auto; font-size:12px; }
-  .progress { display:flex; align-items:center; gap:8px; margin:10px 0; font-size:13px; color:var(--muted); }
-  .progress .spin { display:inline-block; animation:spin 1s linear infinite; }
-  .artifact { display:inline-flex; align-items:center; gap:6px; background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:5px 14px; font-size:13px; text-decoration:none; color:var(--fg); box-shadow:var(--shadow); }
-  .artifact:hover { border-color:var(--accent); color:var(--accent); }
-  .artifact .size { color:var(--muted); font-size:11px; }
-  #runStatus { margin:10px 0 0; font-size:13px; color:var(--muted); display:flex; align-items:center; gap:8px; }
-  #runStatus .spin { display:inline-block; animation:spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  #todoPanel { margin:10px 0 0; background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); padding:10px 14px; }
-  #todoPanel .t-title { font-size:12px; color:var(--muted); margin-bottom:6px; font-weight:600; }
-  #todoPanel .t-item { font-size:13px; padding:2px 0; display:flex; gap:8px; align-items:baseline; }
-  #todoPanel .t-item.done { color:var(--muted); text-decoration:line-through; }
-  #todoPanel .t-item.doing { color:var(--accent); font-weight:600; }
-  html[data-theme="dark"] .msg pre { background:rgba(255,255,255,.06); }
-
-  /* ---------- auth ---------- */
-  #auth { display:none; min-height:calc(100vh - 56px); align-items:center; justify-content:center; }
-  #auth .card { background:var(--panel); border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); width:380px; padding:30px; display:flex; flex-direction:column; gap:12px; }
-  #auth h2 { margin:0 0 6px; text-align:center; color:var(--accent); }
-  #auth input { background:var(--bg); color:var(--fg); border:1px solid var(--line); padding:11px 12px; border-radius:10px; font:inherit; }
-  #auth .btn { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:11px; font-weight:600; }
-  #authMsg { color:var(--muted); font-size:13px; text-align:center; }
-</style>
+<link rel="stylesheet" href="css/app.css">
 </head>
 <body>
 <div id="topnav">
   <div class="logo"><span class="mark">X</span> Excel Agent</div>
   <nav>
-    <a href="#" class="active">首页</a>
+    <a href="#" class="active" id="navHome">首页</a>
     <a href="#">案例</a>
     <a href="#">工具</a>
     <a href="#">开始创作</a>
@@ -136,7 +18,29 @@
   </nav>
   <div class="right">
     <button class="icon-btn" id="themeBtn">🌙 深色</button>
-    <div class="user"><span class="avatar" id="avatar">?</span><span id="whoami"></span></div>
+    <div id="account">
+      <button id="accountBtn" aria-haspopup="true" aria-expanded="false">
+        <span class="avatar" id="avatar">?</span>
+        <span class="who"><span class="name" id="acctName"></span><span class="pts" id="acctPts">🪙 0</span></span>
+      </button>
+      <div id="accountMenu" role="menu">
+        <div class="head">
+          <div class="row1"><span class="name" id="menuName"></span><span class="badge" id="menuPlan">FREE</span></div>
+          <div class="email" id="menuEmail"></div>
+        </div>
+        <div class="stats">
+          <div class="stat hi"><span class="k">积分</span><span class="v" id="stPoints">0</span></div>
+          <div class="stat"><span class="k">套餐积分</span><span class="v" id="stPlanPoints">0</span></div>
+          <div class="stat"><span class="k">积分包</span><span class="v" id="stPackPoints">0</span></div>
+          <div class="stat"><span class="k">到期时间</span><span class="v" id="stExpiry">无有效期</span></div>
+        </div>
+        <div class="items">
+          <button class="item" id="menuProfile" role="menuitem"><span class="ic">👤</span>个人中心</button>
+          <button class="item" id="menuUsage" role="menuitem"><span class="ic">🗄️</span>积分记录</button>
+          <button class="item" id="menuLogout" role="menuitem"><span class="ic">↩︎</span>退出登录</button>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -207,491 +111,48 @@
   </div>
 </div>
 
-<script>
-const TASKS = [
-  { icon: "🧹", name: "数据清洗", tpl: "请清洗上传的表格：去除重复行、处理缺失值、统一日期与数字格式，输出清洗后的文件。" },
-  { icon: "🧮", name: "公式计算", tpl: "请在表格中新增计算列（如合计、占比、同比增长率），并说明使用的公式。" },
-  { icon: "📊", name: "图表生成", tpl: "请根据表格数据生成合适的图表（柱状图/折线图/饼图），保存为图片并给出分析结论。" },
-  { icon: "🎨", name: "格式美化", tpl: "请美化表格：设置表头样式、列宽、数字格式、冻结首行，并添加边框。" },
-  { icon: "🔗", name: "数据合并", tpl: "请将上传的多个表格按关键列合并（VLOOKUP/JOIN 语义），输出合并后的结果。" },
-  { icon: "📑", name: "报表生成", tpl: "请基于表格数据生成一份汇总报表：关键指标、分组统计，并输出为新的 Excel 文件。" },
-];
+<div id="profile">
+  <div class="wrap">
+    <div class="card">
+      <div class="phead">
+        <div class="pavatar" id="pAvatar">?</div>
+        <div style="flex:1">
+          <div class="pname"><h1 id="pName"></h1><span class="edit" id="pEdit">✎ 修改</span></div>
+          <div class="phone">手机号: <span id="pPhone">未绑定</span><span class="bind" id="pBind">绑定手机号</span></div>
+          <div class="pills">
+            <span class="pill on">互动 <b id="pInteract">0</b></span>
+            <span class="pill">免费体验</span>
+            <span class="pill">总积分 <b id="pPoints">0</b> <span class="lnk" id="pPointsLog">积分记录</span></span>
+            <span class="pill">套餐积分 <b id="pPlanPoints">0</b></span>
+            <span class="pill">积分包 <b id="pPackPoints">0</b></span>
+            <span class="pill">到期 <b id="pExpiry">无有效期</b></span>
+          </div>
+          <div class="sub">
+            <div class="sic">💳</div>
+            <div>
+              <div class="row1">订阅信息 <span class="badge" id="pPlan">FREE</span></div>
+              <div class="exp">到期: <span id="pSubExpiry">无有效期</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
 
-const api = {
-  token: sessionStorage.getItem('token') || '',
-  async req(path, opts = {}) {
-    const res = await fetch(path, { ...opts, headers: {
-      ...(opts.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
-      ...(this.token ? { Authorization: 'Bearer ' + this.token } : {}),
-      ...(opts.headers || {}),
-    }});
-    if (res.status === 401) { showAuth('登录已过期，请重新登录'); throw new Error('unauthorized'); }
-    return res;
-  }
-};
-const $ = id => document.getElementById(id);
-let currentConv = null, currentRun = null, es = null;
-let pendingFiles = [];   // uploaded file rows for the current conversation
+    <div style="height:22px"></div>
 
-function showAuth(msg) {
-  $('app').style.display = 'none'; $('auth').style.display = 'flex';
-  $('authMsg').textContent = msg || '';
-  sessionStorage.removeItem('token'); api.token = '';
-}
-function showApp() {
-  $('auth').style.display = 'none'; $('app').style.display = 'block';
-  loadConversations(); loadMe();
-}
+    <div class="tabs">
+      <button class="tab active" id="tabWorks">🎬 我的创作 (<span id="tabWorksN">0</span>)</button>
+      <button class="tab" id="tabFav">♡ 收藏 (<span id="tabFavN">0</span>)</button>
+      <button class="tab" id="tabLike">👍 点赞 (<span id="tabLikeN">0</span>)</button>
+    </div>
+    <div class="worksHead">
+      <span></span>
+      <span class="cnt">● 我的创作 · <span id="worksCount">0</span> 个</span>
+    </div>
+    <div class="works" id="works"></div>
+  </div>
+</div>
 
-function errMsg(res) {
-  return res.json().then(j => {
-    const d = j.detail ?? j;
-    return Array.isArray(d) ? d.map(e => `${(e.loc || []).slice(1).join('.')}: ${e.msg}`).join('; ') : String(d);
-  }).catch(() => res.statusText || 'request failed');
-}
-
-/* ---------- auth ---------- */
-$('loginBtn').onclick = async () => {
-  const email = $('email').value.trim(), password = $('password').value;
-  let res = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password }) });
-  if (res.status === 401 || res.status === 403) {
-    res = await fetch('/auth/register', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }) });
-  }
-  if (!res.ok) { $('authMsg').textContent = '登录失败: ' + await errMsg(res); return; }
-  const tokens = await res.json();
-  api.token = tokens.access_token; sessionStorage.setItem('token', api.token);
-  showApp();
-};
-$('password').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginBtn').click(); });
-
-async function loadMe() {
-  const res = await api.req('/auth/me');
-  if (!res.ok) return;
-  const me = await res.json();
-  $('whoami').textContent = me.email;
-  $('avatar').textContent = me.email[0].toUpperCase();
-}
-
-/* ---------- theme ---------- */
-$('themeBtn').onclick = () => {
-  const dark = document.documentElement.dataset.theme === 'dark';
-  document.documentElement.dataset.theme = dark ? '' : 'dark';
-  $('themeBtn').textContent = dark ? '🌙 深色' : '☀️ 浅色';
-};
-
-/* ---------- conversations ---------- */
-async function loadConversations() {
-  const res = await api.req('/conversations');
-  const list = await res.json();
-  const box = $('convList'); box.innerHTML = '';
-  if (!list.length) { box.innerHTML = '<div class="empty">暂无历史作品</div>'; return; }
-  for (const c of list) {
-    const div = document.createElement('div');
-    div.className = 'cnv' + (c.id === currentConv ? ' active' : '');
-    div.innerHTML = `<span style="overflow:hidden;text-overflow:ellipsis">${escapeHtml(c.title)}</span><span class="del" title="删除">✕</span>`;
-    div.onclick = e => {
-      if (e.target.classList.contains('del')) { deleteConversation(c.id); return; }
-      openConversation(c.id, c.title);
-    };
-    box.appendChild(div);
-  }
-}
-async function deleteConversation(id) {
-  if (!confirm('删除该对话及其上传文件？')) return;
-  await api.req('/conversations/' + id, { method: 'DELETE' });
-  if (currentConv === id) newConversation();
-  loadConversations();
-}
-function newConversation() {
-  currentConv = null; currentRun = null;
-  if (es) { es.close(); es = null; }
-  pendingFiles = [];
-  renderFiles();
-  setRunStatus('', false);
-  renderTodos(null);
-  $('artifacts').style.display = 'none';
-  $('promptBox').value = ''; $('charCount').textContent = '0';
-  $('home').style.display = 'block'; $('chat').style.display = 'none';
-  loadConversations();
-}
-$('newConvBtn').onclick = newConversation;
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-async function openConversation(id, title) {
-  currentConv = id;
-  if (es) { es.close(); es = null; }
-  currentRun = null;
-  setRunStatus('', false);
-  renderTodos(null);
-  const res = await api.req('/conversations/' + id);
-  const detail = await res.json();
-  pendingFiles = detail.files || [];
-  renderFiles();
-  $('home').style.display = 'none'; $('chat').style.display = 'block';
-  const box = $('messages'); box.innerHTML = '';
-  for (const run of detail.runs) {
-    addMsg('user', run.prompt);
-    if (run.events && run.events.length) {
-      let agentDiv = null;
-      for (const e of run.events) agentDiv = renderEvent(e, agentDiv, false);
-    } else if (run.answer) {
-      addMsg('agent', run.answer);
-    }
-    if (run.error) addMsg('err', run.error);
-  }
-  loadConversations();
-  loadArtifacts();
-}
-
-/* ---------- artifacts ---------- */
-async function loadArtifacts() {
-  const box = $('artifactChips');
-  if (!currentConv) { $('artifacts').style.display = 'none'; return; }
-  const res = await api.req(`/conversations/${currentConv}/artifacts`);
-  if (!res.ok) { $('artifacts').style.display = 'none'; return; }
-  const list = await res.json();
-  box.innerHTML = '';
-  for (const a of list) {
-    const link = document.createElement('a');
-    link.className = 'artifact';
-    link.href = '#';
-    link.innerHTML = `⬇ ${escapeHtml(a.name)} <span class="size">${fmtSize(a.size)}</span>`;
-    link.onclick = async e => {
-      e.preventDefault();
-      const r = await api.req(`/conversations/${currentConv}/artifacts/${encodeURIComponent(a.name)}`);
-      if (!r.ok) { alert('下载失败'); return; }
-      const url = URL.createObjectURL(await r.blob());
-      const tmp = document.createElement('a');
-      tmp.href = url; tmp.download = a.name; tmp.click();
-      URL.revokeObjectURL(url);
-    };
-    box.appendChild(link);
-  }
-  $('artifacts').style.display = list.length ? 'block' : 'none';
-}
-function fmtSize(n) {
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  return (n / 1024 / 1024).toFixed(1) + ' MB';
-}
-
-/* ---------- files ---------- */
-function renderFiles() {
-  for (const box of [$('fileChips'), $('fileChips2')]) {
-    box.innerHTML = '';
-    for (const f of pendingFiles) {
-      const chip = document.createElement('span');
-      chip.className = 'chip';
-      chip.innerHTML = `📄 ${escapeHtml(f.filename)} <span class="x" title="移除">✕</span>`;
-      chip.querySelector('.x').onclick = async () => {
-        await api.req(`/conversations/${currentConv}/files/${f.id}`, { method: 'DELETE' });
-        pendingFiles = pendingFiles.filter(x => x.id !== f.id);
-        renderFiles();
-      };
-      box.appendChild(chip);
-    }
-  }
-}
-async function uploadFiles(input) {
-  const files = [...input.files]; input.value = '';
-  if (!files.length) return;
-  if (!currentConv) {
-    const res = await api.req('/conversations', { method: 'POST', body: JSON.stringify({ title: 'Excel 任务' }) });
-    const c = await res.json(); currentConv = c.id;
-  }
-  for (const f of files) {
-    const fd = new FormData(); fd.append('file', f);
-    const res = await api.req(`/conversations/${currentConv}/files`, { method: 'POST', body: fd });
-    if (!res.ok) { alert('上传失败: ' + await errMsg(res)); continue; }
-    pendingFiles.push(await res.json());
-  }
-  renderFiles();
-  loadConversations();
-}
-$('attachBtn').onclick = () => $('fileInput').click();
-$('attachBtn2').onclick = () => $('fileInput2').click();
-$('fileInput').onchange = e => uploadFiles(e.target);
-$('fileInput2').onchange = e => uploadFiles(e.target);
-
-/* ---------- task cards ---------- */
-const grid = $('taskGrid');
-for (const t of TASKS) {
-  const btn = document.createElement('button');
-  btn.className = 'task';
-  btn.innerHTML = `<div class="thumb">${t.icon}</div><div class="name">${t.name}</div>`;
-  btn.onclick = () => {
-    const box = $('promptBox');
-    box.value = (box.value ? box.value + '\n' : '') + t.tpl;
-    $('charCount').textContent = box.value.length;
-    box.focus();
-  };
-  grid.appendChild(btn);
-}
-$('promptBox').addEventListener('input', e => { $('charCount').textContent = e.target.value.length; });
-
-/* ---------- chat ---------- */
-function addMsg(kind, text) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + kind;
-  if (kind === 'agent') {
-    div.appendChild(renderAnswer(text));
-  } else {
-    div.textContent = text;
-  }
-  $('messages').appendChild(div);
-  $('messages').scrollTop = $('messages').scrollHeight;
-  return div;
-}
-function addAgentText() {
-  const div = document.createElement('div');
-  div.className = 'msg agent';
-  const span = document.createElement('span');
-  div.appendChild(span);
-  $('messages').appendChild(div);
-  $('messages').scrollTop = $('messages').scrollHeight;
-  return span;
-}
-// One live progress row per tool: tool_running updates it in place,
-// tool_start (a new tool / message boundary) starts a fresh row.
-let liveProgress = null;
-function addProgress(text, busy, fresh = false) {
-  if (!liveProgress || fresh) {
-    const div = document.createElement('div');
-    div.className = 'progress';
-    $('messages').appendChild(div);
-    liveProgress = div;
-  }
-  liveProgress.innerHTML = (busy ? '<span class="spin">⚙️</span>' : '<span>✅</span>') +
-    '<span>' + escapeHtml(text) + '</span>';
-  $('messages').scrollTop = $('messages').scrollHeight;
-}
-function renderAnswer(text) {
-  // minimal markdown: code fences + bold
-  const parts = String(text).split(/```/);
-  const frag = document.createDocumentFragment();
-  parts.forEach((p, i) => {
-    if (i % 2 === 1) {
-      const nl = p.indexOf('\n');
-      const pre = document.createElement('pre');
-      pre.textContent = nl >= 0 ? p.slice(nl + 1) : p;
-      frag.appendChild(pre);
-    } else {
-      const span = document.createElement('span');
-      span.innerHTML = escapeHtml(p).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
-      frag.appendChild(span);
-    }
-  });
-  return frag;
-}
-
-function addAsk(data, runId) {
-  const div = document.createElement('div');
-  div.className = 'msg agent';
-  const questions = (data && data.questions) || [];
-  div.innerHTML = '<div class="who">AI 提问</div>';
-  for (const q of questions) {
-    const qtext = q.question || q.text || JSON.stringify(q);
-    const opts = q.options || [];
-    const row = document.createElement('div');
-    row.style.margin = '8px 0';
-    row.innerHTML = `<div>${escapeHtml(qtext)}</div>`;
-    const input = document.createElement('input');
-    input.style.cssText = 'width:100%;margin-top:6px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;color:var(--fg)';
-    input.placeholder = opts.length ? '选择或输入…' : '输入回答…';
-    row.appendChild(input);
-    div.appendChild(row);
-    if (opts.length) {
-      for (const o of opts) {
-        const label = typeof o === 'string' ? o : (o.label || JSON.stringify(o));
-        const b = document.createElement('button');
-        b.className = 'attach-btn'; b.style.margin = '0 6px 6px 0';
-        b.textContent = label;
-        b.onclick = () => { input.value = label; };
-        row.appendChild(b);
-      }
-    }
-  }
-  const send = document.createElement('button');
-  send.id = 'askSend';
-  send.style.cssText = 'background:var(--accent);color:#fff;border:0;border-radius:8px;padding:7px 16px;margin-top:6px';
-  send.textContent = '回答';
-  send.onclick = async () => {
-    const answers = [...div.querySelectorAll('input')].map(i => i.value.trim()).filter(Boolean);
-    if (!answers.length) return;
-    send.disabled = true;
-    const res = await api.req(`/conversations/${currentConv}/runs/${runId}/answer`,
-      { method: 'POST', body: JSON.stringify({ answers }) });
-    if (!res.ok) { send.disabled = false; addMsg('err', await errMsg(res)); return; }
-    div.style.opacity = '.5';
-  };
-  div.appendChild(send);
-  $('messages').appendChild(div);
-  $('messages').scrollTop = $('messages').scrollHeight;
-}
-
-function strData(d) {
-  if (d == null) return '';
-  if (typeof d === 'string') return d;
-  if (Array.isArray(d)) return d.map(strData).join(', ');
-  return JSON.stringify(d);
-}
-// The harness's "tool_calls" payload -> "Bash(command='ls -la')".
-// Each entry is {name, args}; args values arrive pre-formatted and
-// pre-truncated by the harness (repr strings), so they are safe to show
-// verbatim -- addProgress escapes them before they reach the DOM.
-function toolCallLabel(calls) {
-  if (!Array.isArray(calls)) return '';
-  return calls.map(c => toolOneLabel(c)).filter(Boolean).join(', ');
-}
-function toolOneLabel(c) {
-  const name = (c && c.name) || 'tool';
-  const args = (c && typeof c.args === 'object' && c.args) || {};
-  const params = Object.keys(args).map(k => k + '=' + args[k]).join(' ');
-  return params ? name + '(' + params + ')' : name;
-}
-// A tool round reuses ONE progress row (tool_start opens it,
-// tool_running/tool then update it in place), so the command has to be
-// remembered for the row's later states -- otherwise the finished row
-// would read a bare "工具执行完成" and the command would be lost from the
-// transcript.  Reset per round by tool_start.
-let roundLabel = '';
-let roundArgsByName = {};
-// Harness log lines that are bookkeeping rather than progress: the
-// session's generated title says nothing about what the agent is doing.
-const LOG_SKIP = [/^session titled\b/];
-// One harness event (live SSE or stored replay) -> message-flow DOM.
-// Returns the current agent-text span, or null when the event starts a
-// new assistant message (tool_start / retry are message boundaries).
-// live=false (history replay) skips ask/confirm: the run is over, so
-// the answer box would be dead.
-function renderEvent(e, agentDiv, live = true) {
-  if (e.type === 'delta') {
-    if (!agentDiv) agentDiv = addAgentText();
-    agentDiv.textContent += (e.data?.text ?? '');
-    $('messages').scrollTop = $('messages').scrollHeight;
-  } else if (e.type === 'notify' && e.data) {
-    const kind = e.data.kind, data = e.data.data;
-    if (kind === 'tool_start') {
-      agentDiv = null;
-      roundLabel = strData(data);        // names only until tool_calls lands
-      roundArgsByName = {};
-      addProgress('准备执行: ' + roundLabel, true, true);
-    } else if (kind === 'tool_calls') {
-      // Arrives right behind tool_start, naming the same round but with
-      // arguments: upgrade that row in place (no `fresh`) so the user
-      // sees the actual command instead of a bare tool name.
-      const label = toolCallLabel(data);
-      if (label) {
-        roundLabel = label;
-        for (const c of data) {
-          if (c && c.name) roundArgsByName[c.name] = toolOneLabel(c);
-        }
-        addProgress('准备执行: ' + label, true);
-      }
-    } else if (kind === 'tool_running') {
-      const name = strData(data);
-      addProgress('正在执行: ' + (roundArgsByName[name] || name), true);
-    } else if (kind === 'tool') {
-      addProgress(roundLabel ? '完成: ' + roundLabel : '工具执行完成', false);
-    } else if (kind === 'todos') {
-      renderTodos(data);
-    } else if (kind === 'error') {
-      addMsg('err', typeof data === 'string' ? data : JSON.stringify(data));
-    } else if (kind === 'retry') {
-      agentDiv = null;
-      addProgress('模型调用重试中…', true, true);
-    } else if (kind === 'compact') {
-      addProgress('正在压缩上下文…', true);
-    } else if (live && (kind === 'ask' || kind === 'confirm')) {
-      addAsk(data, e.run_id || currentRun);
-    }
-  } else if (e.type === 'log' && e.data && e.data.message) {
-    const msg = String(e.data.message);
-    // Own row (`fresh`): a log line would otherwise overwrite the live
-    // tool row and erase the command the user just saw.  Harness logs
-    // are rare and noteworthy (compaction, MCP, auto-save/agent errors),
-    // so one row each is proportionate.
-    if (!LOG_SKIP.some(re => re.test(msg))) addProgress(msg, true, true);
-  }
-  return agentDiv;
-}
-function setRunStatus(text, busy) {
-  const box = $('runStatus');
-  if (!text) { box.style.display = 'none'; return; }
-  box.style.display = 'flex';
-  box.innerHTML = (busy ? '<span class="spin">⚙️</span>' : '') + '<span>' + escapeHtml(text) + '</span>';
-}
-function renderTodos(items) {
-  const box = $('todoPanel');
-  if (!items || !items.length) { box.style.display = 'none'; return; }
-  box.style.display = 'block';
-  box.innerHTML = '<div class="t-title">📋 任务进度</div>' + items.map(t => {
-    const s = String(t.status || '');
-    const cls = /done|complete/i.test(s) ? 'done' : /progress|active|current/i.test(s) ? 'doing' : '';
-    const icon = cls === 'done' ? '✅' : cls === 'doing' ? '🔄' : '⬜';
-    return `<div class="t-item ${cls}"><span>${icon}</span><span>${escapeHtml(t.content || '')}</span></div>`;
-  }).join('');
-}
-
-function startStream(runId) {
-  currentRun = runId;
-  $('stopBtn2').style.display = 'inline-block';
-  setRunStatus('正在启动…', true);
-  const url = `/conversations/${currentConv}/runs/${runId}/stream?access_token=${encodeURIComponent(api.token)}`;
-  es = new EventSource(url);
-  let agentDiv = null;
-  es.onmessage = ev => {
-    const e = JSON.parse(ev.data);
-    agentDiv = renderEvent(e, agentDiv);
-    if (e.type === 'run') {
-      es.close(); es = null; currentRun = null;
-      $('stopBtn2').style.display = 'none';
-      setRunStatus('', false);
-      openConversation(currentConv, '');
-      loadConversations();
-      loadArtifacts();
-    }
-  };
-  es.onerror = () => { /* refreshed on run end */ };
-}
-
-async function send() {
-  const prompt = $('promptBox2').value.trim();
-  if (!prompt) return;
-  $('promptBox2').value = '';
-  addMsg('user', prompt);
-  if (!currentConv) {
-    const res = await api.req('/conversations', { method: 'POST', body: JSON.stringify({ title: prompt.slice(0, 40) }) });
-    const c = await res.json(); currentConv = c.id;
-  }
-  const res = await api.req(`/conversations/${currentConv}/runs`,
-    { method: 'POST', body: JSON.stringify({ prompt }) });
-  if (!res.ok) { addMsg('err', await errMsg(res)); return; }
-  const run = await res.json();
-  startStream(run.id);
-}
-$('sendBtn').onclick = () => {
-  const p = $('promptBox').value.trim();
-  if (!p) return;
-  $('promptBox2').value = p;
-  $('home').style.display = 'none'; $('chat').style.display = 'block';
-  send();
-};
-$('sendBtn2').onclick = send;
-$('promptBox2').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-});
-$('stopBtn').onclick = $('stopBtn2').onclick = async () => {
-  if (!currentRun) return;
-  await api.req(`/conversations/${currentConv}/runs/${currentRun}/cancel`, { method: 'POST' });
-};
-
-if (api.token) showApp(); else showAuth();
-</script>
+<script type="module" src="js/main.js"></script>
 </body>
 </html>
