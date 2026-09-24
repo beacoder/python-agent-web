@@ -19,8 +19,9 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from ..infra.config import conversation_workspace
+from ..infra.db import commit_now
 from ..models import Conversation, ConversationFile, User, new_id
-from ..models.db import commit_now
+from .access import get_owned
 from .errors import InvalidRequest, NotFound, PayloadTooLarge
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -87,9 +88,14 @@ async def store_upload(
 
 def delete_upload(db: Session, conversation: Conversation, file_id: str) -> None:
     """Forget an upload and unlink it from the workspace."""
-    row = db.get(ConversationFile, file_id)
-    if row is None or row.conversation_id != conversation.id:
-        raise NotFound("file not found")
+    row = get_owned(
+        db,
+        ConversationFile,
+        file_id,
+        owner_field="conversation_id",
+        owner_value=conversation.id,
+        detail="file not found",
+    )
     with contextlib.suppress(OSError):
         Path(row.path).unlink()
     db.delete(row)
