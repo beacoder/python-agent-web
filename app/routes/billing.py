@@ -9,8 +9,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from ..controllers import usage
+from ..infra.db import get_db
 from ..models import User
-from ..models.db import get_db
 from ..routes.auth import authenticate_user
 from ..validation.schemas import UsageSummary
 
