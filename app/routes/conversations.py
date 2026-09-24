@@ -19,9 +19,10 @@ from ..controllers import conversations as conversations_controller
 from ..controllers import files as files_controller
 from ..controllers import runs as runs_controller
 from ..controllers.manager import Controller, get_controller
+from ..infra.db import get_db
 from ..models import Conversation, ConversationFile, Run, User
-from ..models.db import get_db
 from ..routes.auth import authenticate_user
+from ..routes.limits import limit_runs
 from ..validation.schemas import (
     ArtifactOut,
     ConversationCreate,
@@ -163,7 +164,12 @@ def download_artifact(
     return FileResponse(files_controller.artifact_path(conversation, name), filename=name)
 
 
-@router.post("/{conversation_id}/runs", response_model=RunOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{conversation_id}/runs",
+    response_model=RunOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(limit_runs)],
+)
 def start_run(
     conversation_id: str,
     body: RunCreate,
