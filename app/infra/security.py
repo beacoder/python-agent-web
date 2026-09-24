@@ -56,14 +56,19 @@ def create_token(
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
-def create_access_token(user_id: str) -> str:
+def create_access_token(user_id: str, token_version: int = 0) -> str:
     return create_token(
-        user_id, "access", get_settings().access_token_minutes * 60, {"role": "user"}
+        user_id,
+        "access",
+        get_settings().access_token_minutes * 60,
+        {"role": "user", "ver": token_version},
     )
 
 
-def create_refresh_token(user_id: str) -> str:
-    return create_token(user_id, "refresh", get_settings().refresh_token_days * 86400)
+def create_refresh_token(user_id: str, token_version: int = 0) -> str:
+    return create_token(
+        user_id, "refresh", get_settings().refresh_token_days * 86400, {"ver": token_version}
+    )
 
 
 def decode_token(token: str, expected_type: str) -> dict[str, Any]:
