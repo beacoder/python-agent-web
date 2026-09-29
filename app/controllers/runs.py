@@ -13,11 +13,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from ..models import Conversation, ConversationFile, Run
+from ..models import Conversation, ConversationFile, Run, User
 from .access import get_owned
 from .conversations import files_of
 from .errors import Conflict
 from .manager import Controller
+from .usage import enforce_budget
 
 # Told to the agent, not to the user: the sandbox cwd is the only place
 # a produced file can be picked up from, and the model has no other way
@@ -52,6 +53,11 @@ def start(
     prompt: str,
 ) -> Run:
     """Begin a run for the conversation's next turn."""
+    # Spend kill-switch: refuse before doing any work if the user is out
+    # of token budget (no-op unless budget enforcement is enabled).
+    user = db.get(User, user_id)
+    if user is not None:
+        enforce_budget(db, user)
     harness_prompt = build_harness_prompt(prompt, files_of(db, conversation))
     try:
         return controller.start_run(
