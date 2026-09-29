@@ -10,6 +10,7 @@ boot, and startup warns when they are unset.
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -42,12 +43,93 @@ class SandboxSettings(BaseSettings):
     """Idle reaper TTL: a sandbox unused this long is destroyed."""
 
 
+class StorageSettings(BaseSettings):
+    """Durable blob-store selection for uploads and artifacts.
+
+    ``local`` is a directory tree (dev / single node); ``s3`` is an
+    S3-compatible bucket (prod / multi-node).  The per-conversation
+    workspace is unaffected -- this is the durable tier behind it.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PAW_STORAGE__")
+
+    backend: str = "local"
+    """``local`` or ``s3``."""
+
+    local_root: str = "./storage"
+    """Root directory for the ``local`` backend."""
+
+    s3_bucket: str = ""
+    """Bucket name for the ``s3`` backend."""
+
+    s3_prefix: str = ""
+    """Key prefix within the bucket (namespacing, e.g. ``paw/``)."""
+
+    s3_region: str = ""
+    """AWS region; empty = SDK default resolution."""
+
+    s3_endpoint_url: str = ""
+    """Custom endpoint (e.g. MinIO / localstack); empty = real AWS."""
+
+
+class DockerSettings(BaseSettings):
+    """Container isolation knobs for the ``docker`` runner.
+
+    Defaults are the safe ones: no network, dropped capabilities,
+    read-only rootfs, non-root user, resource ceilings.  A wedged or
+    hostile run is therefore bounded and cannot reach the host env, the
+    database, or other tenants' workspaces.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PAW_DOCKER__")
+
+    image: str = "python-agent-harness:latest"
+    """Sandbox image; harness must be its entrypoint-able command.
+    Pin by digest in production (``name@sha256:...``)."""
+
+    workdir: str = "/workspace"
+    """Container path the conversation workspace is mounted at (cwd)."""
+
+    network: str = "none"
+    """Container network mode; ``none`` = no egress (exfiltration/SSRF
+    off).  Override only with an explicit, filtered egress policy."""
+
+    mem_limit: str = "1g"
+    """Hard memory ceiling (docker ``mem_limit`` syntax)."""
+
+    nano_cpus: int = 1_000_000_000
+    """CPU quota in units of 1e-9 CPUs (1e9 = one core)."""
+
+    pids_limit: int = 256
+    """Max PIDs in the container (fork-bomb ceiling)."""
+
+    user: str = "1000:1000"
+    """Non-root uid:gid the harness runs as inside the container."""
+
+    read_only_rootfs: bool = True
+    """Mount the container root filesystem read-only (scratch via tmpfs)."""
+
+    tmpfs_size: str = "256m"
+    """Size of the writable ``/tmp`` tmpfs mounted into the container."""
+
+    stop_timeout: int = 5
+    """Seconds to wait after SIGTERM before the daemon kills on destroy."""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="PAW_", env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
     db_url: str = "sqlite:///./paw.db"
+    db_pool_size: int = 5
+    """SQLAlchemy connection pool size (server DBs only; ignored for
+    SQLite).  One pool per web replica."""
+    db_max_overflow: int = 10
+    """Extra connections allowed beyond ``db_pool_size`` under load."""
+    db_pool_recycle_s: int = 1800
+    """Recycle a pooled connection after this many seconds, so a
+    connection a proxy would drop is replaced proactively."""
     secret_key: str = "dev-only-insecure-key-change-me-0123456789abcdef"
     fernet_key: str = ""
     """Fernet key for the secrets store; empty = derived from
@@ -63,9 +145,12 @@ class Settings(BaseSettings):
     runner: str = "server"
     """Sandbox runner: ``server`` (one resident ``harness serve``
     process per sandbox: multi-turn memory, mid-run Q&A, protocol-level
-    cancel).  Docker later."""
-    harness: HarnessSettings = HarnessSettings()
-    sandbox: SandboxSettings = SandboxSettings()
+    cancel) or ``docker`` (the same, isolated in a per-sandbox
+    container: no host env, no host filesystem, no network by default)."""
+    harness: HarnessSettings = Field(default_factory=HarnessSettings)
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+    docker: DockerSettings = Field(default_factory=DockerSettings)
+    storage: StorageSettings = Field(default_factory=StorageSettings)
 
     cors_origins: list[str] = []
     """Extra allowed CORS origins for a split frontend."""
@@ -81,6 +166,40 @@ class Settings(BaseSettings):
     """Max run submissions per user per window (the cost-incurring path)."""
     rate_limit_auth: int = 10
     """Max login/register attempts per client IP per window."""
+
+    rate_limit_backend: str = "memory"
+    """Rate-limit store: ``memory`` (process-local, per-instance) or
+    ``redis`` (shared across instances for a global limit)."""
+    rate_limit_redis_url: str = ""
+    """Redis URL for the ``redis`` backend; empty = localhost default."""
+
+    shutdown_drain_seconds: float = 25.0
+    """On shutdown, how long to wait for in-flight runs to finish before
+    exiting.  Keep under the orchestrator's SIGTERM grace period so the
+    drain completes before a forced kill; runs still in flight at the
+    deadline are reconciled to ``error`` on the next startup."""
+
+    budget_enforce: bool = False
+    """Enforce a per-user token budget before starting a run (the spend
+    kill-switch).  Off by default so existing/dev deployments are
+    unaffected; turn on for a public billed platform."""
+    budget_free_tokens: int = 1_000_000
+    """Token allowance for a user with no purchased points (the free
+    tier).  Total budget = this + ``tokens_per_point`` × the user's
+    points."""
+    budget_tokens_per_point: int = 1000
+    """How many tokens one account point is worth, converting the
+    points buckets (plan_points + pack_points) into a token budget."""
+
+    max_upload_bytes: int = 100 * 1024 * 1024
+    """Per-file upload size cap."""
+    max_user_storage_bytes: int = 1024 * 1024 * 1024
+    """Per-user total storage quota across all conversations (sum of
+    uploaded file sizes).  0 disables the quota."""
+    upload_allowed_types: list[str] = []
+    """Allow-list of upload content types by short name (e.g.
+    ``["xlsx", "csv", "pdf", "png"]``), validated by magic bytes.  Empty
+    = no content validation (any type accepted; dev default)."""
 
 
 @lru_cache(maxsize=1)
