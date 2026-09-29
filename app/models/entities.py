@@ -115,6 +115,11 @@ class Run(Base):
     events: Mapped[list] = mapped_column(JSON, default=list)
     error: Mapped[str] = mapped_column(Text, default="")
     harness_run_id: Mapped[str] = mapped_column(String(64), default="")
+    # The web instance that owns this run's in-process worker thread.
+    # Set while running so a restart reconciles only its OWN orphaned
+    # runs (never another live instance's) -- see
+    # Controller.reconcile_orphaned_runs.  Null once finished.
+    owner_instance: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
