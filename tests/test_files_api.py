@@ -47,6 +47,88 @@ class TestFileRoutes:
         detail = client.get(f"/conversations/{conversation_id}", headers=headers).json()
         assert detail["files"] == []
 
+    def test_upload_durably_persisted(self, client: TestClient) -> None:
+        """Upload writes through to the durable store, and delete removes
+        it from there too (not just the workspace)."""
+        from app.controllers.files import durable_key
+        from app.infra.storage import get_storage
+
+        headers, conversation_id = _setup(client)
+        res = client.post(
+            f"/conversations/{conversation_id}/files",
+            headers=headers,
+            files={"file": ("data.csv", b"a,b,c\n1,2,3\n", "application/octet-stream")},
+        )
+        file_id = res.json()["id"]
+        # the stored_name is the single file present in the workspace
+        workspace = Path(get_settings().workspace_root) / conversation_id
+        stored_name = next(workspace.iterdir()).name
+
+        store = get_storage()
+        key = durable_key(conversation_id, stored_name)
+        assert store.exists(key), "upload was not written through to durable storage"
+        assert store.get_bytes(key) == b"a,b,c\n1,2,3\n"
+
+        client.delete(f"/conversations/{conversation_id}/files/{file_id}", headers=headers)
+        assert not store.exists(key), "durable copy was not removed on delete"
+
+    def test_artifact_durability_sync_and_rehydrate(self, client: TestClient) -> None:
+        """Agent outputs are synced to durable storage and can be
+        rehydrated into a fresh workspace from there (pod-loss / other
+        instance)."""
+        from app.controllers import files as files_controller
+        from app.controllers.files import durable_key
+        from app.infra.config import conversation_workspace
+        from app.infra.db import get_session_factory
+        from app.infra.storage import get_storage
+        from app.models import Conversation as Conv
+
+        headers, conversation_id = _setup(client)
+        ws = conversation_workspace(conversation_id)
+        (ws / "final.xlsx").write_bytes(b"PK\x03\x04agent-output")
+
+        db = get_session_factory()()
+        try:
+            conv = db.get(Conv, conversation_id)
+            synced = files_controller.sync_artifacts(db, conv)
+            assert "final.xlsx" in synced
+            store = get_storage()
+            assert store.exists(durable_key(conversation_id, "final.xlsx"))
+            # simulate pod loss / other instance: remove the local copy
+            (ws / "final.xlsx").unlink()
+            # artifact_path rehydrates from durable storage
+            path = files_controller.artifact_path(conv, "final.xlsx")
+            assert path.read_bytes() == b"PK\x03\x04agent-output"
+        finally:
+            db.close()
+
+    def test_sync_artifacts_skips_unchanged(self, client: TestClient) -> None:
+        """A second sync must not re-upload an artifact whose durable copy
+        already matches by size (avoids O(all files) re-upload per run)."""
+        from app.controllers import files as files_controller
+        from app.infra.config import conversation_workspace
+        from app.infra.db import get_session_factory
+        from app.models import Conversation as Conv
+
+        headers, conversation_id = _setup(client)
+        ws = conversation_workspace(conversation_id)
+        (ws / "out.csv").write_bytes(b"a,b\n1,2\n")
+
+        db = get_session_factory()()
+        try:
+            conv = db.get(Conv, conversation_id)
+            first = files_controller.sync_artifacts(db, conv)
+            assert first == ["out.csv"]
+            # unchanged: second sync skips it
+            second = files_controller.sync_artifacts(db, conv)
+            assert second == []
+            # change the file: it is synced again
+            (ws / "out.csv").write_bytes(b"a,b\n1,2\n3,4\n")
+            third = files_controller.sync_artifacts(db, conv)
+            assert third == ["out.csv"]
+        finally:
+            db.close()
+
     def test_upload_requires_auth(self, client: TestClient) -> None:
         conversation_id = "cnv_missing"
         res = client.post(
@@ -124,9 +206,7 @@ class TestFileRoutes:
         """The size cap is enforced while streaming, and the partial file
         is removed -- a half-written upload must not linger in the
         agent's cwd where it could be mistaken for real input."""
-        from app.controllers import files as files_controller
-
-        monkeypatch.setattr(files_controller, "MAX_UPLOAD_BYTES", 8)
+        monkeypatch.setattr(get_settings(), "max_upload_bytes", 8)
         headers, conversation_id = _setup(client)
         res = client.post(
             f"/conversations/{conversation_id}/files",
