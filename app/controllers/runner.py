@@ -685,9 +685,7 @@ class DockerRunner(Runner):
         client = self._docker()
         container = client.containers.create(**self._create_kwargs(meta))
         container.start()
-        sock = container.attach_socket(
-            params={"stdin": 1, "stdout": 1, "stderr": 1, "stream": 1}
-        )
+        sock = container.attach_socket(params={"stdin": 1, "stdout": 1, "stderr": 1, "stream": 1})
         # SDK wraps the raw socket; unwrap to the object with recv/sendall
         raw = getattr(sock, "_sock", sock)
         stream = _DockerStream(raw, stderr_sink=meta["stderr_log"].append)
@@ -899,9 +897,7 @@ class DockerRunner(Runner):
         with self._lock:
             self._live_run[sandbox_id] = run_id
         try:
-            if not self._send(
-                stream, lock, {"op": "submit", "prompt": prompt, "run_id": run_id}
-            ):
+            if not self._send(stream, lock, {"op": "submit", "prompt": prompt, "run_id": run_id}):
                 return ExecResult(
                     exit_code=None, stdout="", stderr="harness container died before submit"
                 )
@@ -910,9 +906,7 @@ class DockerRunner(Runner):
                 container,
                 on_line,
                 timeout,
-                cancel_op=lambda: self._send(
-                    stream, lock, {"op": "cancel", "run_id": run_id}
-                ),
+                cancel_op=lambda: self._send(stream, lock, {"op": "cancel", "run_id": run_id}),
             )
             if not saw_result and not timed_out:
                 return ExecResult(
