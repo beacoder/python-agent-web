@@ -708,9 +708,9 @@ class DockerRunner(Runner):
             container, stream = self._spawn(meta)
         except Exception:
             # tolerate a failed spawn like ServerRunner: retried at exec
-            container, stream = None, None  # type: ignore[assignment]
+            container, stream = None, None
         with self._lock:
-            if container is not None:
+            if container is not None and stream is not None:
                 self._containers[sandbox_id] = container
                 self._streams[sandbox_id] = stream
                 self._locks[sandbox_id] = threading.Lock()
@@ -887,11 +887,15 @@ class DockerRunner(Runner):
             # single ready line is consumed) and block until the watchdog
             meta["ready_ok"] = True
         elif not meta.get("ready_ok"):
-            if not self._read_ready(stream):
+            if stream is None or not self._read_ready(stream):
                 return ExecResult(
                     exit_code=None, stdout="", stderr="harness container died before ready"
                 )
             meta["ready_ok"] = True
+        if stream is None:
+            # alive container with no stream handle is a corrupt state;
+            # fail the run clearly rather than proceed with None
+            return ExecResult(exit_code=None, stdout="", stderr="sandbox stream unavailable")
         self.touch(sandbox_id)
         err_from = len(meta["stderr_log"])
         with self._lock:
