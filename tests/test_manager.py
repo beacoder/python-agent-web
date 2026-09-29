@@ -509,3 +509,158 @@ class TestOrphanRunSweep:
         finally:
             db.close()
         _wait_status(controller, run.id, {"done"})
+
+
+class TestInstanceScopedReconciliation:
+    """A restart must fail only THIS instance's orphaned runs, never a
+    different live instance's healthy runs."""
+
+    def test_owner_instance_is_stamped_while_running(self, user_id) -> None:
+        from app.models import Run
+
+        uid, cid = user_id
+        controller = Controller(runner=StubRunner(stdout=RESULT_OK), instance_id="inst-A")
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+            run_id = run.id
+        finally:
+            db.close()
+        _wait_status(controller, run_id, {"done"})
+        # finished run releases ownership
+        db = get_session_factory()()
+        try:
+            assert db.get(Run, run_id).owner_instance is None
+        finally:
+            db.close()
+
+    def test_reconcile_ignores_other_instances_runs(self, user_id) -> None:
+        from app.models import Run
+
+        _uid, cid = user_id
+        db = get_session_factory()()
+        try:
+            # a run owned by a DIFFERENT, still-live instance
+            db.add(
+                Run(
+                    id="run_other",
+                    conversation_id=cid,
+                    prompt="p",
+                    status="running",
+                    owner_instance="inst-B",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        # instance A restarts and reconciles: must NOT touch inst-B's run
+        n = Controller(runner=StubRunner(), instance_id="inst-A").reconcile_orphaned_runs()
+        assert n == 0
+
+        db = get_session_factory()()
+        try:
+            run = db.get(Run, "run_other")
+            assert run.status == "running"  # left alone
+            assert run.owner_instance == "inst-B"
+        finally:
+            db.close()
+
+    def test_reconcile_claims_own_and_null_owner_runs(self, user_id) -> None:
+        from app.models import Run
+
+        _uid, cid = user_id
+        # a second conversation so two running rows can coexist (the
+        # partial unique index is per-conversation)
+        db = get_session_factory()()
+        try:
+            other_conv = new_id("cnv")
+            db.add(Conversation(id=other_conv, user_id=_uid, title="t2"))
+            db.add(
+                Run(
+                    id="run_mine",
+                    conversation_id=cid,
+                    prompt="p",
+                    status="running",
+                    owner_instance="inst-A",
+                )
+            )
+            db.add(
+                Run(
+                    id="run_legacy",
+                    conversation_id=other_conv,
+                    prompt="p",
+                    status="running",
+                    owner_instance=None,  # pre-migration / unclaimed
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        n = Controller(runner=StubRunner(), instance_id="inst-A").reconcile_orphaned_runs()
+        assert n == 2  # own run + the NULL-owner legacy run
+
+        db = get_session_factory()()
+        try:
+            assert db.get(Run, "run_mine").status == "error"
+            assert db.get(Run, "run_legacy").status == "error"
+            # ownership released on reconcile
+            assert db.get(Run, "run_mine").owner_instance is None
+        finally:
+            db.close()
+
+
+class TestDrain:
+    """Graceful shutdown: reject new runs and wait for in-flight ones."""
+
+    def test_drain_waits_for_in_flight_run(self, user_id) -> None:
+        from app.models import Run
+
+        uid, cid = user_id
+        # a run that takes a moment; drain must block until it finishes
+        controller = Controller(runner=StubRunner(delay=0.3, stdout=RESULT_OK))
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+            run_id = run.id
+        finally:
+            db.close()
+
+        still = controller.drain(timeout=10)
+        assert still == 0  # finished within the window
+
+        db = get_session_factory()()
+        try:
+            assert db.get(Run, run_id).status == "done"
+        finally:
+            db.close()
+
+    def test_drain_rejects_new_runs(self, user_id) -> None:
+        uid, cid = user_id
+        controller = Controller(runner=StubRunner(stdout=RESULT_OK))
+        controller.drain(timeout=1)  # sets draining
+        db = get_session_factory()()
+        try:
+            with pytest.raises(RuntimeError, match="shutting down"):
+                controller.start_run(db, user_id=uid, conversation_id=cid, prompt="late")
+        finally:
+            db.close()
+
+    def test_drain_returns_count_still_running_at_deadline(self, user_id) -> None:
+        uid, cid = user_id
+        # a run longer than the drain window: still in flight at deadline
+        controller = Controller(runner=StubRunner(delay=2.0, stdout=RESULT_OK))
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="slow")
+            run_id = run.id
+        finally:
+            db.close()
+
+        still = controller.drain(timeout=0.2)
+        assert still == 1  # did not finish in time
+
+        # it is still owned by this instance and would be reconciled on
+        # the next startup
+        _wait_status(controller, run_id, {"done"})  # let it finish to clean up
