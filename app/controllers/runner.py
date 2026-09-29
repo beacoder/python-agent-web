@@ -4,8 +4,9 @@
 run inside it, destroy it.  ``ServerRunner`` implements the contract
 with one resident ``python-agent-harness serve`` process per sandbox,
 spoken to over the bidirectional JSONL protocol; ``DockerRunner``
-(later) will implement the same interface against container images so
-the trust boundary becomes real isolation.
+implements the same interface against a per-sandbox container so the
+trust boundary becomes real isolation (no host env, no host
+filesystem, no network by default, resource-capped).
 """
 
 from __future__ import annotations
@@ -391,6 +392,11 @@ class ServerRunner(Runner):
                 self._procs[sandbox_id] = proc
                 self._locks[sandbox_id] = threading.Lock()
                 lock = self._locks[sandbox_id]
+            # the freshly respawned process has now passed its ready
+            # handshake; mark it so a later exec on this live process does
+            # not call _read_ready again (its single ready line is gone,
+            # and a second read would block until the watchdog kills it)
+            meta["ready_ok"] = True
         elif not meta.get("ready_ok"):
             if not self._read_ready(proc):
                 return ExecResult(
@@ -512,8 +518,505 @@ class ServerRunner(Runner):
         return stdout_lines, timed_out.is_set(), saw_result
 
 
+class _DockerStream:
+    """A newline-reader / line-writer over a docker attach socket.
+
+    Presents the same ``readline()`` / ``write(str)`` surface the
+    resident-process pumping code expects from a pipe, so
+    ``DockerRunner`` can reuse the ready-handshake and pump-until-result
+    logic unchanged.  A non-TTY attach multiplexes stdout/stderr into
+    8-byte-framed chunks; we demultiplex, routing stdout to the line
+    buffer and stderr to an optional sink.
+
+    The underlying object only needs ``recv``/``sendall``/``close`` (a
+    real socket, or a fake in tests).
+    """
+
+    _HEADER = 8  # docker stream frame: [stream, 0,0,0, size(4, big-endian)]
+
+    def __init__(self, sock: Any, stderr_sink: Any = None) -> None:
+        self._sock = sock
+        self._stderr_sink = stderr_sink
+        self._buf = b""  # raw framed bytes not yet demultiplexed
+        self._pending = b""  # demultiplexed stdout bytes awaiting a newline
+        self._closed = False
+
+    def _demux(self, chunk: bytes) -> bytes:
+        """Split a raw framed chunk into stdout bytes; feed stderr to the
+        sink.  Frames can straddle recv boundaries, so leftover header/
+        payload bytes are retained across calls."""
+        self._buf += chunk
+        out = b""
+        while len(self._buf) >= self._HEADER:
+            stream_type = self._buf[0]
+            size = int.from_bytes(self._buf[4:8], "big")
+            if len(self._buf) < self._HEADER + size:
+                break  # payload incomplete; wait for more
+            payload = self._buf[self._HEADER : self._HEADER + size]
+            self._buf = self._buf[self._HEADER + size :]
+            if stream_type == 2 and self._stderr_sink is not None:  # stderr
+                with contextlib.suppress(Exception):
+                    self._stderr_sink(payload.decode("utf-8", "replace"))
+            else:
+                out += payload
+        return out
+
+    def readline(self) -> str:
+        """One demultiplexed stdout line ('' on EOF), like a text pipe.
+
+        Frames can carry several lines at once, so demultiplexed stdout
+        is buffered and handed back one newline-terminated line per call
+        -- returning a multi-line blob would break the JSONL parser that
+        reads this stream one ``result``-bearing line at a time.
+        """
+        while b"\n" not in self._pending:
+            try:
+                chunk = self._sock.recv(4096)
+            except (OSError, ValueError):
+                chunk = b""
+            if not chunk:
+                self._closed = True
+                # flush any trailing partial line at EOF
+                if self._pending:
+                    line, self._pending = self._pending, b""
+                    return line.decode("utf-8", "replace")
+                return ""
+            self._pending += self._demux(chunk)
+        line, _, self._pending = self._pending.partition(b"\n")
+        return (line + b"\n").decode("utf-8", "replace")
+
+    def write(self, data: str) -> None:
+        self._sock.sendall(data.encode("utf-8"))
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._sock.close()
+
+
+class DockerRunner(Runner):
+    """Isolated runner: one long-lived container per sandbox, running
+    ``harness serve`` and spoken to over the same bidirectional JSONL
+    protocol as ``ServerRunner`` -- but across a container boundary.
+
+    The trust boundary is real here: the container gets no host
+    environment (only ``PAW_NONINTERACTIVE`` plus the owner's decrypted
+    secrets, injected host-side at create), no host filesystem beyond
+    the conversation's own workspace mount, no network by default, a
+    read-only rootfs, dropped Linux capabilities, a non-root user, and
+    hard memory/cpu/pid ceilings.  A hostile prompt therefore cannot
+    read ``paw.db``, the app secret key, or another tenant's data, and a
+    wedged run is resource-bounded.
+
+    The resident model is unchanged from ``ServerRunner``: the container
+    survives between turns (multi-turn memory), cancel/answer are
+    protocol lines written to its stdin, and ``exec_run`` streams stdout
+    JSONL through *on_line* until the ``result`` line.
+    """
+
+    def __init__(self, client: Any = None, secret_source: Any = None) -> None:
+        # client / secret_source are injectable for tests; production
+        # builds a real docker client lazily (so the SDK is only needed
+        # when PAW_RUNNER=docker) and decrypts secrets host-side.
+        self._client = client
+        self._secret_source = secret_source
+        self._sandboxes: dict[str, dict[str, Any]] = {}
+        self._streams: dict[str, _DockerStream] = {}
+        self._containers: dict[str, Any] = {}
+        self._locks: dict[str, threading.Lock] = {}  # per-sandbox write lock
+        self._live_run: dict[str, str | None] = {}
+        self._exec_locks: dict[str, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    # -- client / secrets -------------------------------------------------
+
+    def _docker(self) -> Any:
+        if self._client is None:
+            import docker  # lazy: only required for PAW_RUNNER=docker
+
+            self._client = docker.from_env()
+        return self._client
+
+    def _secrets_for(self, user_id: str) -> dict[str, str]:
+        """Owner's decrypted secrets, host-side.  Empty when no source
+        is wired (tests) or the user has none."""
+        if self._secret_source is None:
+            return {}
+        try:
+            return dict(self._secret_source(user_id))
+        except Exception:  # a secrets failure must not brick sandbox create
+            return {}
+
+    # -- sandbox lifecycle ------------------------------------------------
+
+    def _container_env(self, user_id: str) -> dict[str, str]:
+        """The container's ENTIRE environment: never the host env.
+
+        Only the noninteractive flag and the owner's own decrypted
+        secrets.  This is the line that closes the ``dict(os.environ)``
+        leak that ``ServerRunner`` has.
+        """
+        env = {"PAW_NONINTERACTIVE": "1"}
+        env.update(self._secrets_for(user_id))
+        return env
+
+    def _create_kwargs(self, meta: dict[str, Any]) -> dict[str, Any]:
+        d = get_settings().docker
+        return {
+            "image": d.image,
+            "command": ["serve"],
+            "environment": self._container_env(meta["user_id"]),
+            "working_dir": d.workdir,
+            "volumes": {meta["workspace"]: {"bind": d.workdir, "mode": "rw"}},
+            "network_mode": d.network,
+            "mem_limit": d.mem_limit,
+            "nano_cpus": d.nano_cpus,
+            "pids_limit": d.pids_limit,
+            "user": d.user,
+            "read_only": d.read_only_rootfs,
+            "tmpfs": {"/tmp": f"size={d.tmpfs_size}"},
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges"],
+            "stdin_open": True,
+            "detach": True,
+            "labels": {"paw.sandbox": meta["sandbox_id"], "paw.user": meta["user_id"]},
+        }
+
+    def _spawn(self, meta: dict[str, Any]) -> tuple[Any, _DockerStream]:
+        client = self._docker()
+        container = client.containers.create(**self._create_kwargs(meta))
+        container.start()
+        sock = container.attach_socket(
+            params={"stdin": 1, "stdout": 1, "stderr": 1, "stream": 1}
+        )
+        # SDK wraps the raw socket; unwrap to the object with recv/sendall
+        raw = getattr(sock, "_sock", sock)
+        stream = _DockerStream(raw, stderr_sink=meta["stderr_log"].append)
+        return container, stream
+
+    def create(self, user_id: str, conversation_id: str) -> str:
+        sandbox_id = f"sbx_{uuid.uuid4().hex}"
+        meta = {
+            "sandbox_id": sandbox_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "workspace": str(conversation_workspace(conversation_id)),
+            "created_ts": time.time(),
+            "last_used": time.time(),
+            "stderr_log": deque(maxlen=200),
+        }
+        with self._lock:
+            self._sandboxes[sandbox_id] = meta
+        try:
+            container, stream = self._spawn(meta)
+        except Exception:
+            # tolerate a failed spawn like ServerRunner: retried at exec
+            container, stream = None, None  # type: ignore[assignment]
+        with self._lock:
+            if container is not None:
+                self._containers[sandbox_id] = container
+                self._streams[sandbox_id] = stream
+                self._locks[sandbox_id] = threading.Lock()
+                self._live_run[sandbox_id] = None
+                self._exec_locks[sandbox_id] = threading.Lock()
+        return sandbox_id
+
+    def _container_alive(self, container: Any) -> bool:
+        if container is None:
+            return False
+        try:
+            container.reload()
+        except Exception:
+            return False
+        return getattr(container, "status", None) == "running"
+
+    def destroy(self, sandbox_id: str) -> None:
+        with self._lock:
+            self._sandboxes.pop(sandbox_id, None)
+            container = self._containers.pop(sandbox_id, None)
+            stream = self._streams.pop(sandbox_id, None)
+            self._locks.pop(sandbox_id, None)
+            self._live_run.pop(sandbox_id, None)
+            self._exec_locks.pop(sandbox_id, None)
+        if stream is not None:
+            stream.close()
+        if container is not None:
+            timeout = get_settings().docker.stop_timeout
+            with contextlib.suppress(Exception):
+                container.stop(timeout=timeout)
+            with contextlib.suppress(Exception):
+                container.remove(force=True)
+
+    def exists(self, sandbox_id: str) -> bool:
+        with self._lock:
+            return sandbox_id in self._sandboxes
+
+    def touch(self, sandbox_id: str) -> None:
+        with self._lock:
+            if sandbox_id in self._sandboxes:
+                self._sandboxes[sandbox_id]["last_used"] = time.time()
+
+    def cancel(self, sandbox_id: str, run_id: str) -> bool:
+        with self._lock:
+            stream = self._streams.get(sandbox_id)
+            live = self._live_run.get(sandbox_id)
+            lock = self._locks.get(sandbox_id)
+        if stream is None or live != run_id:
+            return False
+        self.touch(sandbox_id)
+        return self._send(stream, lock, {"op": "cancel", "run_id": run_id})
+
+    def deliver_answer(self, sandbox_id: str, run_id: str, answers: list[str]) -> bool:
+        with self._lock:
+            stream = self._streams.get(sandbox_id)
+            live = self._live_run.get(sandbox_id)
+            lock = self._locks.get(sandbox_id)
+        if stream is None or live != run_id:
+            return False
+        self.touch(sandbox_id)
+        return self._send(stream, lock, {"op": "answer", "run_id": run_id, "answers": answers})
+
+    def reap_idle(self, ttl_seconds: float) -> list[str]:
+        now = time.time()
+        destroyed: list[str] = []
+        with self._lock:
+            for sandbox_id, meta in list(self._sandboxes.items()):
+                if now - float(meta.get("last_used", 0.0)) > ttl_seconds:
+                    destroyed.append(sandbox_id)
+        for sandbox_id in destroyed:
+            self.destroy(sandbox_id)
+        return destroyed
+
+    # -- process I/O ------------------------------------------------------
+
+    def _send(self, stream: _DockerStream | None, lock: threading.Lock | None, op: dict) -> bool:
+        if stream is None:
+            return False
+        if lock is None:
+            lock = threading.Lock()
+        try:
+            with lock:
+                stream.write(json.dumps(op) + "\n")
+        except (ValueError, OSError):
+            return False
+        return True
+
+    def _read_ready(self, stream: _DockerStream, timeout: float = 30.0) -> bool:
+        """Consume the container's ``ready`` line before the first op.
+
+        readline blocks on the socket with no data, so a watchdog closes
+        the stream on deadline to unblock a startup hang (bad image,
+        import error, ...).
+        """
+        ready = threading.Event()
+
+        def _close_on_deadline() -> None:
+            if not ready.wait(timeout):
+                stream.close()
+
+        watchdog = threading.Thread(target=_close_on_deadline, daemon=True)
+        watchdog.start()
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    return False
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("type") == "ready":
+                    return True
+        finally:
+            ready.set()
+
+    def exec_run(
+        self,
+        sandbox_id: str,
+        prompt: str,
+        run_id: str,
+        on_line: Any = None,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        with self._lock:
+            meta = self._sandboxes.get(sandbox_id)
+            exec_lock = self._exec_locks.get(sandbox_id)
+        if meta is None:
+            raise SandboxNotFoundError(sandbox_id)
+        # exec_lock is missing only when create()'s spawn also failed;
+        # make one so a respawn-at-exec can still serialize.
+        if exec_lock is None:
+            exec_lock = threading.Lock()
+            with self._lock:
+                self._exec_locks[sandbox_id] = exec_lock
+        with exec_lock:
+            return self._exec_run_locked(sandbox_id, prompt, run_id, on_line, timeout, meta)
+
+    def _exec_run_locked(
+        self,
+        sandbox_id: str,
+        prompt: str,
+        run_id: str,
+        on_line: Any,
+        timeout: float | None,
+        meta: dict[str, Any],
+    ) -> ExecResult:
+        with self._lock:
+            container = self._containers.get(sandbox_id)
+            stream = self._streams.get(sandbox_id)
+            lock = self._locks.get(sandbox_id)
+            live_slot = self._live_run.get(sandbox_id)
+        if live_slot is not None:
+            raise RuntimeError(f"sandbox {sandbox_id} already has a live run")
+        # respawn a dead/never-started container; a fresh one must pass
+        # the ready handshake before it can take ops.
+        if not self._container_alive(container):
+            try:
+                container, stream = self._spawn(meta)
+            except Exception as exc:
+                return ExecResult(exit_code=None, stdout="", stderr=f"exec failed: {exc}")
+            meta["stderr_log"].clear()
+            if not self._read_ready(stream):
+                return ExecResult(
+                    exit_code=None, stdout="", stderr="harness container died before ready"
+                )
+            lock = threading.Lock()
+            with self._lock:
+                self._containers[sandbox_id] = container
+                self._streams[sandbox_id] = stream
+                self._locks[sandbox_id] = lock
+            # respawned container passed its ready handshake; mark it so a
+            # later exec on this live container does not re-read ready (its
+            # single ready line is consumed) and block until the watchdog
+            meta["ready_ok"] = True
+        elif not meta.get("ready_ok"):
+            if not self._read_ready(stream):
+                return ExecResult(
+                    exit_code=None, stdout="", stderr="harness container died before ready"
+                )
+            meta["ready_ok"] = True
+        self.touch(sandbox_id)
+        err_from = len(meta["stderr_log"])
+        with self._lock:
+            self._live_run[sandbox_id] = run_id
+        try:
+            if not self._send(
+                stream, lock, {"op": "submit", "prompt": prompt, "run_id": run_id}
+            ):
+                return ExecResult(
+                    exit_code=None, stdout="", stderr="harness container died before submit"
+                )
+            stdout_lines, timed_out, saw_result = self._pump_until_result(
+                stream,
+                container,
+                on_line,
+                timeout,
+                cancel_op=lambda: self._send(
+                    stream, lock, {"op": "cancel", "run_id": run_id}
+                ),
+            )
+            if not saw_result and not timed_out:
+                return ExecResult(
+                    exit_code=_container_exit_code(container),
+                    stdout="".join(stdout_lines),
+                    stderr="".join(list(meta["stderr_log"])[err_from:])
+                    or "harness container died mid-run",
+                )
+        finally:
+            with self._lock:
+                self._live_run[sandbox_id] = None
+        return ExecResult(
+            exit_code=0 if not timed_out else None,
+            stdout="".join(stdout_lines),
+            stderr="".join(list(meta["stderr_log"])[err_from:]),
+            timed_out=timed_out,
+        )
+
+    def _pump_until_result(
+        self,
+        stream: _DockerStream,
+        container: Any,
+        on_line: Any,
+        timeout: float | None,
+        cancel_op: Any = None,
+    ) -> tuple[list[str], bool, bool]:
+        """Read stdout lines until the run's ``result`` line (or death).
+
+        Mirrors ``ServerRunner._pump_until_result``: the container is
+        resident, so the run's terminal marker is its parsed ``result``
+        line, never a substring match.  On timeout the watchdog sends
+        the protocol cancel first (graceful unwind, history retained)
+        and kills the container only if the cancel is ignored.
+        """
+        stdout_lines: list[str] = []
+        saw_result = False
+        done = threading.Event()
+        timed_out = threading.Event()
+
+        if timeout is not None:
+
+            def _kill_on_deadline() -> None:
+                if not done.wait(timeout):
+                    timed_out.set()
+                    if cancel_op is not None:
+                        cancel_op()
+                        if done.wait(10):
+                            return  # unwound gracefully
+                    with contextlib.suppress(Exception):
+                        if container is not None:
+                            container.kill()
+                    stream.close()
+
+            threading.Thread(target=_kill_on_deadline, daemon=True).start()
+
+        while True:
+            line = stream.readline()
+            if not line:  # EOF: container died / killed / timed out
+                break
+            line = line.rstrip("\n")
+            stdout_lines.append(line + "\n")
+            if on_line is not None:
+                with contextlib.suppress(Exception):
+                    on_line(line)
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(payload, dict) and payload.get("type") == "result":
+                saw_result = True
+                done.set()
+                break
+        return stdout_lines, timed_out.is_set(), saw_result
+
+
+def _container_exit_code(container: Any) -> int | None:
+    """Exit code of a container whose stream reached EOF (or None)."""
+    if container is None:
+        return None
+    try:
+        container.reload()
+        return container.attrs.get("State", {}).get("ExitCode")
+    except Exception:
+        return None
+
+
 def get_runner() -> Runner:
     settings = get_settings()
     if settings.runner == "server":
         return ServerRunner()
-    raise ValueError(f"unknown runner: {settings.runner!r} (docker runner pending)")
+    if settings.runner == "docker":
+        return DockerRunner(secret_source=_default_secret_source)
+    raise ValueError(f"unknown runner: {settings.runner!r}")
+
+
+def _default_secret_source(user_id: str) -> dict[str, str]:
+    """Host-side secret decryption for the docker runner's env injection.
+
+    Opens its own session (the runner has no request scope) and returns
+    the owner's ``{name: value}`` map.  The Fernet key stays in this
+    trusted process; only the isolated container receives plaintext.
+    """
+    from ..controllers import secrets as secrets_controller
+    from ..infra.db import get_session_factory
+
+    with get_session_factory()() as db:
+        return secrets_controller.decrypt_for_user(db, user_id)
