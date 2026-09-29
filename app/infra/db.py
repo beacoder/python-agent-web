@@ -27,6 +27,16 @@ def make_engine(db_url: str | None = None) -> Engine:
     kwargs: dict[str, Any] = {}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
+    else:
+        # Server databases (Postgres) need real pooling and liveness
+        # checks: pool_pre_ping discards connections a proxy/DB dropped
+        # (a common cause of "server closed the connection unexpectedly"
+        # after an idle period), and the sizes are tunable per replica.
+        settings = get_settings()
+        kwargs["pool_pre_ping"] = True
+        kwargs["pool_size"] = settings.db_pool_size
+        kwargs["max_overflow"] = settings.db_max_overflow
+        kwargs["pool_recycle"] = settings.db_pool_recycle_s
     engine = create_engine(url, **kwargs)
     if url.startswith("sqlite"):
 
