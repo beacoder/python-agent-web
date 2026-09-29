@@ -10,6 +10,8 @@ htmlcov/
 *.db-wal
 .nfs*
 workspaces/
+storage/
 .env
 .venv/
 venv/
+.kiro/
