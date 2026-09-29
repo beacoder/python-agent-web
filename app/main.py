@@ -12,7 +12,7 @@ import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +22,7 @@ from .controllers.manager import get_controller
 from .infra.config import get_settings
 from .infra.db import get_engine
 from .infra.logging import configure_logging, get_logger, reset_request_id, set_request_id
+from .infra.metrics import get_registry, normalize_method
 from .routes import account, auth, billing, conversations, secrets
 
 _log = get_logger("request")
@@ -34,6 +35,10 @@ async def lifespan(app: FastAPI):
     controller.reconcile_orphaned_runs()  # fail runs stranded by a restart
     controller.reap_idle_sandboxes()
     yield
+    # graceful shutdown: stop taking new runs and let in-flight ones
+    # finish (bounded), so a deploy does not kill short runs mid-flight.
+    # Whatever does not finish in time is reconciled on the next start.
+    controller.drain(timeout=get_settings().shutdown_drain_seconds)
 
 
 def create_app() -> FastAPI:
@@ -66,6 +71,22 @@ def create_app() -> FastAPI:
                 )
             dur_ms = (time.perf_counter() - start) * 1000
             response.headers["X-Request-ID"] = rid
+            # metrics: count by method+status and record latency.  The
+            # method is normalized to a bounded set so arbitrary/garbage
+            # verbs cannot create unbounded metric series.
+            registry = get_registry()
+            method = normalize_method(request.method)
+            registry.counter(
+                "paw_http_requests_total",
+                labels={"method": method, "status": str(response.status_code)},
+                help="HTTP requests by method and status.",
+            )
+            registry.observe(
+                "paw_http_request_duration_seconds",
+                dur_ms / 1000.0,
+                labels={"method": method},
+                help="HTTP request latency in seconds.",
+            )
             _log.info(
                 "%s %s -> %s %.1fms",
                 request.method,
@@ -111,6 +132,12 @@ def create_app() -> FastAPI:
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True, "runner": settings.runner}
+
+    @app.get("/metrics")
+    def metrics() -> Response:
+        """Prometheus text exposition of process metrics (runs, tokens,
+        HTTP, span durations).  Scrape target for a monitoring stack."""
+        return Response(get_registry().render(), media_type="text/plain; version=0.0.4")
 
     static_dir = Path(__file__).parent / "views"
     if static_dir.is_dir():
