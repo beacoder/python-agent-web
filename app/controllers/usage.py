@@ -118,6 +118,5 @@ def enforce_budget(db: Session, user: User) -> None:
     status = budget_status(db, user)
     if status.exhausted:
         raise PaymentRequired(
-            f"token budget exhausted ({status.consumed}/{status.budget}); "
-            "add credits to continue"
+            f"token budget exhausted ({status.consumed}/{status.budget}); add credits to continue"
         )
