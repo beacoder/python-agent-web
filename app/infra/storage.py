@@ -39,23 +39,29 @@ class Storage(Protocol):
 
     def put_bytes(self, key: str, data: bytes) -> None:
         """Store ``data`` under ``key`` (overwrites)."""
+        ...
 
     def put_stream(self, key: str, stream: BinaryIO) -> int:
         """Store a stream under ``key``; return the number of bytes written."""
+        ...
 
     def get_bytes(self, key: str) -> bytes:
         """Return the bytes stored under ``key`` (raises if absent)."""
+        ...
 
     def open_stream(self, key: str) -> Iterator[bytes]:
         """Yield the object's bytes in chunks (raises if absent)."""
+        ...
 
     def exists(self, key: str) -> bool: ...
 
     def size(self, key: str) -> int | None:
         """Byte length of the stored object, or None if absent."""
+        ...
 
     def delete(self, key: str) -> None:
         """Remove ``key``; a missing key is not an error (idempotent)."""
+        ...
 
 
 _CHUNK = 1024 * 1024
