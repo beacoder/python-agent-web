@@ -65,7 +65,9 @@ class TestDecryptForUser:
 
         with self._session() as db:
             user = self._user(db)
-            secrets_controller.put(db, user, "OPENAI_API_KEY", body_name="OPENAI_API_KEY", value="sk-1")
+            secrets_controller.put(
+                db, user, "OPENAI_API_KEY", body_name="OPENAI_API_KEY", value="sk-1"
+            )
             secrets_controller.put(db, user, "STRIPE_KEY", body_name="STRIPE_KEY", value="sk-2")
             env = secrets_controller.decrypt_for_user(db, user.id)
         assert env == {"OPENAI_API_KEY": "sk-1", "STRIPE_KEY": "sk-2"}
