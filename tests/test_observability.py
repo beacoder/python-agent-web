@@ -170,5 +170,5 @@ class TestTracing:
         with span("timed.block"):
             pass
         out = get_registry().render()
-        assert 'paw_span_duration_seconds' in out
+        assert "paw_span_duration_seconds" in out
         assert 'span="timed.block"' in out
