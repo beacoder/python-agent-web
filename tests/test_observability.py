@@ -75,3 +75,100 @@ class TestLogConfig:
         assert out["level"] == "INFO"
         assert out["request_id"] == "r1"
         assert out["message"] == "hello"
+
+
+class TestMetrics:
+    def test_metrics_endpoint_exposes_prometheus_text(self, client: TestClient) -> None:
+        # generate some traffic first
+        client.get("/healthz")
+        res = client.get("/metrics")
+        assert res.status_code == 200
+        assert "text/plain" in res.headers["content-type"]
+        body = res.text
+        assert "paw_http_requests_total" in body
+        assert "# TYPE paw_http_requests_total counter" in body
+
+    def test_http_requests_counted_by_status(self, client: TestClient) -> None:
+        from app.infra.metrics import get_registry
+
+        get_registry().reset()
+        client.get("/healthz")  # 200
+        client.get("/auth/me")  # 401
+        body = client.get("/metrics").text
+        assert 'paw_http_requests_total{method="GET",status="200"}' in body
+        # the 401 from /auth/me is counted too
+        assert 'status="401"' in body
+
+    def test_counter_and_histogram_render(self) -> None:
+        from app.infra.metrics import MetricsRegistry
+
+        r = MetricsRegistry()
+        r.counter("things_total", 3, labels={"kind": "a"})
+        r.observe("lat_seconds", 0.2)
+        out = r.render()
+        assert 'things_total{kind="a"} 3.0' in out
+        assert "lat_seconds_bucket" in out
+        assert "lat_seconds_count" in out
+        assert "lat_seconds_sum" in out
+
+    def test_method_label_is_bounded(self) -> None:
+        from app.infra.metrics import normalize_method
+
+        assert normalize_method("get") == "GET"
+        assert normalize_method("POST") == "POST"
+        # an arbitrary/garbage verb collapses to a single bucket so it
+        # cannot create unbounded metric series
+        assert normalize_method("BREW") == "other"
+        assert normalize_method("../../etc") == "other"
+
+    def test_garbage_method_does_not_grow_series(self, client: TestClient) -> None:
+        from app.infra.metrics import get_registry
+
+        get_registry().reset()
+        # a request with an unusual method must not mint a new label value
+        client.request("BREW", "/healthz")
+        body = client.get("/metrics").text
+        assert 'method="other"' in body
+        assert 'method="BREW"' not in body
+
+
+class TestTracing:
+    def test_span_is_noop_without_tracer(self) -> None:
+        from app.infra.metrics import span
+
+        # no tracer registered: must not raise, just runs the block
+        ran = []
+        with span("work", {"k": "v"}):
+            ran.append(1)
+        assert ran == [1]
+
+    def test_span_delegates_to_registered_tracer(self) -> None:
+        from contextlib import contextmanager
+
+        from app.infra.metrics import set_tracer, span
+
+        calls = []
+
+        class FakeTracer:
+            @contextmanager
+            def span(self, name, attributes=None):
+                calls.append((name, attributes))
+                yield
+
+        set_tracer(FakeTracer())
+        try:
+            with span("run.exec", {"run_id": "r1"}):
+                pass
+            assert calls == [("run.exec", {"run_id": "r1"})]
+        finally:
+            set_tracer(None)  # restore no-op for other tests
+
+    def test_span_records_duration_metric(self) -> None:
+        from app.infra.metrics import get_registry, span
+
+        get_registry().reset()
+        with span("timed.block"):
+            pass
+        out = get_registry().render()
+        assert 'paw_span_duration_seconds' in out
+        assert 'span="timed.block"' in out
