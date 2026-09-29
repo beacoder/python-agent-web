@@ -61,6 +61,16 @@ class PayloadTooLarge(DomainError):
     status_code = 413
 
 
+class PaymentRequired(DomainError):
+    """The user has exhausted their token/spend budget (402).
+
+    The billing kill-switch: raised before a cost-incurring run starts
+    when the usage ledger shows the user is at or over their allotment.
+    """
+
+    status_code = 402
+
+
 class TooManyRequests(DomainError):
     """Rate limit exceeded (429).
 
