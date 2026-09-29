@@ -148,6 +148,28 @@ class TestExecRun:
         finally:
             runner.destroy(sandbox)
 
+    def test_exec_after_respawn_does_not_reread_ready(self, runner: ServerRunner) -> None:
+        """Regression: after a respawn consumes the fresh process's single
+        ``ready`` line, the NEXT exec on the live process must not call
+        _read_ready again (there is no second ready line) -- doing so
+        would block until the watchdog kills a healthy process.  A short
+        timeout makes the bug show up as a timed-out/failed run."""
+        sandbox = runner.create("u", "c")
+        try:
+            runner._procs[sandbox].kill()
+            runner._procs[sandbox].wait(timeout=5)
+            first = runner.exec_run(sandbox, "respawn", "run_a", timeout=30)
+            assert first.exit_code == 0
+            # second exec on the now-live respawned process: must complete
+            # promptly, not hang on a phantom ready read
+            second = runner.exec_run(sandbox, "again", "run_b", timeout=10)
+            assert second.exit_code == 0
+            assert not second.timed_out
+            assert "answered: again" in second.stdout
+            assert runner._sandboxes[sandbox].get("ready_ok") is True
+        finally:
+            runner.destroy(sandbox)
+
     def test_timeout_kills_and_reports(self, tmp_path) -> None:
         """A harness that ignores the cancel op is escalated to kill.
 
