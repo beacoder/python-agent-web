@@ -11,12 +11,15 @@ misses anything.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -42,10 +45,24 @@ class ActiveRun:
 class Controller:
     """Coordinates sandboxes, harness execs, and subscribers."""
 
-    def __init__(self, runner: Runner | None = None) -> None:
+    def __init__(self, runner: Runner | None = None, instance_id: str | None = None) -> None:
         self._runner = runner or get_runner()
         self._active: dict[str, ActiveRun] = {}
         self._lock = threading.Lock()
+        # Stable per-process identity so a restart reconciles only its
+        # OWN orphaned runs, never another live instance's.  Overridable
+        # for tests; defaults to a value stable for this process.
+        self._instance_id = instance_id or _default_instance_id()
+        # In-flight run worker threads, tracked so shutdown can drain
+        # them (let short runs finish) instead of killing them mid-run.
+        self._workers: dict[str, threading.Thread] = {}
+        # Set on shutdown: reject new runs while draining so we do not
+        # start work we are about to abandon.
+        self._draining = threading.Event()
+
+    @property
+    def instance_id(self) -> str:
+        return self._instance_id
 
     # -- subscriptions ----------------------------------------------------
 
@@ -97,6 +114,11 @@ class Controller:
         if existing is not None:
             raise RuntimeError("conversation already has a running run")
 
+        # Reject new work once shutdown has begun: a run started now
+        # would be abandoned by the imminent exit.
+        if self._draining.is_set():
+            raise RuntimeError("server is shutting down; run rejected")
+
         sandbox = self._ensure_sandbox(db, user_id=user_id, conversation_id=conversation_id)
         run = Run(
             id=new_id("run"),
@@ -104,6 +126,7 @@ class Controller:
             prompt=prompt,
             status="running",
             harness_run_id="",
+            owner_instance=self._instance_id,
         )
         db.add(run)
         # Commit now: the worker thread finalizes the row from its own
@@ -153,7 +176,19 @@ class Controller:
             outcome.duration_ms = int((time.time() - started) * 1000)
             self._finish_run(run_id, outcome)
 
-        threading.Thread(target=_worker, name=f"run-{run_id}", daemon=True).start()
+        def _tracked_worker() -> None:
+            try:
+                _worker()
+            finally:
+                # untrack self so drain() does not wait on a finished
+                # thread and the dict does not grow unbounded
+                with self._lock:
+                    self._workers.pop(run_id, None)
+
+        thread = threading.Thread(target=_tracked_worker, name=f"run-{run_id}", daemon=True)
+        with self._lock:
+            self._workers[run_id] = thread
+        thread.start()
         return run
 
     def cancel_run(self, run_id: str) -> bool:
@@ -251,10 +286,36 @@ class Controller:
             _log.warning("run %s finished: %s — %s", run_id, final_state, "; ".join(outcome.errors))
         else:
             _log.info("run %s finished: %s (%dms)", run_id, final_state, outcome.duration_ms)
+        # metrics: runs by terminal state, latency, and tokens spent
+        from ..infra.metrics import get_registry
+
+        registry = get_registry()
+        registry.counter(
+            "paw_runs_total", labels={"state": final_state}, help="Runs by terminal state."
+        )
+        if outcome.duration_ms:
+            registry.observe(
+                "paw_run_duration_seconds",
+                outcome.duration_ms / 1000.0,
+                help="Run wall-clock duration in seconds.",
+            )
+        if outcome.usage:
+            tokens = int(outcome.usage.get("input", 0) or 0) + int(
+                outcome.usage.get("output", 0) or 0
+            )
+            if tokens:
+                registry.counter(
+                    "paw_tokens_total", value=tokens, help="LLM tokens consumed across runs."
+                )
         try:
             with get_session_factory()() as db:
                 _write_terminal_run(db, run_id, outcome, final_state, events)
                 db.commit()
+                # persist agent outputs to durable storage while we have
+                # a session and the run's conversation is known.  Runs on
+                # the terminal path so an errored/cancelled run's partial
+                # outputs are captured too.
+                _sync_run_artifacts(db, run_id)
         finally:
             self._close_active(run_id, final_state)
 
@@ -287,32 +348,82 @@ class Controller:
     # -- reaper ------------------------------------------------------------
 
     def reconcile_orphaned_runs(self) -> int:
-        """Fail runs left ``running`` by a previous process (startup only).
+        """Fail runs left ``running`` by a previous life of THIS instance.
 
         Runs execute on in-process daemon threads, so a restart abandons
         any in-flight run while its row still says ``running`` — stranding
         it forever and (via the partial unique index) blocking the
         conversation from starting a new one.  At startup ``_active`` is
-        empty, so every ``running`` row is orphaned: mark them ``error``.
-        Returns the number reconciled.
+        empty, so any ``running`` row this instance owns is orphaned:
+        mark them ``error``.
+
+        Instance-scoped on purpose: a multi-instance deploy has other
+        live instances whose ``running`` rows are healthy.  Matching on
+        ``owner_instance`` means this instance's restart never touches
+        another's runs.  Legacy rows with a NULL owner (pre-migration)
+        are reconciled too, since no live instance claims them.  Returns
+        the number reconciled.
         """
         with get_session_factory()() as db:
             n = (
                 db.query(Run)
-                .filter(Run.status == "running")
+                .filter(
+                    Run.status == "running",
+                    or_(
+                        Run.owner_instance == self._instance_id,
+                        Run.owner_instance.is_(None),
+                    ),
+                )
                 .update(
                     {
                         Run.status: "error",
                         Run.error: "interrupted by server restart",
                         Run.finished_at: _now(),
+                        Run.owner_instance: None,
                     },
                     synchronize_session=False,
                 )
             )
             db.commit()
         if n:
-            _log.warning("reconciled %d orphaned run(s) to error on startup", n)
+            _log.warning(
+                "reconciled %d orphaned run(s) to error on startup (instance %s)",
+                n,
+                self._instance_id,
+            )
         return n
+
+    def drain(self, timeout: float = 25.0) -> int:
+        """Stop accepting new runs and wait for in-flight ones to finish.
+
+        Called from the app's shutdown (SIGTERM): flips the draining
+        flag so ``start_run`` rejects new work, then joins the live
+        worker threads up to ``timeout`` (kept under the orchestrator's
+        grace period).  Runs that finish within the window persist their
+        result normally; any still running at the deadline are left for
+        the next startup's instance-scoped reconciliation.  Returns the
+        number of workers still running when the wait ended (0 = clean).
+        """
+        self._draining.set()
+        with self._lock:
+            threads = list(self._workers.values())
+        deadline = time.time() + timeout
+        for thread in threads:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        with self._lock:
+            still_running = sum(1 for t in self._workers.values() if t.is_alive())
+        if still_running:
+            _log.warning(
+                "drain: %d run(s) still in flight at deadline; "
+                "reconciled on next startup",
+                still_running,
+            )
+        else:
+            _log.info("drain: all in-flight runs finished cleanly")
+        return still_running
 
     def reap_idle_sandboxes(self) -> list[str]:
         destroyed = self._runner.reap_idle(get_settings().sandbox.ttl_seconds)
@@ -352,6 +463,9 @@ def _write_terminal_run(
     run.exit_code = outcome.exit_code
     run.cancelled = outcome.cancelled
     run.finished_at = _now()
+    # release ownership: a finished run is no longer any instance's to
+    # reconcile (defensive — status is already terminal here).
+    run.owner_instance = None
     if outcome.duration_ms:
         run.duration_ms = outcome.duration_ms
     if events is not None:
@@ -455,3 +569,39 @@ def _now():
     from ..models import utcnow
 
     return utcnow()
+
+
+def _sync_run_artifacts(db: Session, run_id: str) -> None:
+    """Best-effort: push a finished run's agent outputs to durable storage.
+
+    Deferred import keeps the machinery layer from importing the files
+    domain at module load.  Never raises -- artifact durability must not
+    turn a finished run into a failed one.
+    """
+    try:
+        from . import files as files_controller
+
+        run = db.get(Run, run_id)
+        if run is None:
+            return
+        conversation = db.get(Conversation, run.conversation_id)
+        if conversation is None:
+            return
+        files_controller.sync_artifacts(db, conversation)
+    except Exception:  # durability is best-effort; log and move on
+        _log.warning("run %s: artifact sync failed", run_id, exc_info=True)
+
+
+def _default_instance_id() -> str:
+    """Stable identity for this process's run ownership.
+
+    Prefers ``PAW_INSTANCE_ID`` (set it to the pod/task name in an
+    orchestrator so the id survives as a meaningful label); otherwise
+    derives a per-process id from hostname + pid, which is stable for
+    the life of the process and unique enough to distinguish instances.
+    """
+    explicit = os.environ.get("PAW_INSTANCE_ID")
+    if explicit:
+        return explicit[:64]
+    host = os.environ.get("HOSTNAME") or "host"
+    return f"{host}-{os.getpid()}-{uuid.uuid4().hex[:6]}"[:64]
