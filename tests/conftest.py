@@ -20,16 +20,21 @@ def _isolated_settings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("PAW_SECRET_KEY", "test-secret-key-not-for-prod-0123456789abcdef")
     monkeypatch.setenv("PAW_RUNNER", "server")
     monkeypatch.setenv("PAW_WORKSPACE_ROOT", f"{tmp}/workspaces")
+    monkeypatch.setenv("PAW_STORAGE__LOCAL_ROOT", f"{tmp}/storage")
+    monkeypatch.setenv("PAW_RATE_LIMIT_BACKEND", "memory")
     get_settings.cache_clear()
     db_mod._engine = None
     db_mod._session_factory = None
-    from app.infra.ratelimit import limiter
+    from app.infra.ratelimit import reset_limiter_for_tests
 
-    limiter.reset()  # the limiter is a process-wide singleton; isolate tests
+    # drop the cached limiter so the next use rebuilds from this test's
+    # config; do NOT build here (a test may set a bad backend on purpose)
+    reset_limiter_for_tests()
     yield
     get_settings.cache_clear()
     db_mod._engine = None
     db_mod._session_factory = None
+    reset_limiter_for_tests()
 
 
 @pytest.fixture()
