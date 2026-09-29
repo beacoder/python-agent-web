@@ -287,7 +287,7 @@ class TestIsolation:
         volumes = kwargs["volumes"]
         # exactly one bind mount, and it maps to the container workdir
         assert len(volumes) == 1
-        (host_path, spec), = volumes.items()
+        ((host_path, spec),) = volumes.items()
         assert spec["bind"] == kwargs["working_dir"]
         assert "c" in host_path  # the conversation workspace, nothing else
 
