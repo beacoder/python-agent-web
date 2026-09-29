@@ -103,3 +103,97 @@ class TestDomainErrors:
         err = NotFound("conversation not found")
         assert err.detail == "conversation not found"
         assert str(err) == "conversation not found"
+
+
+class TestUploadDurability:
+    """store_upload write-through: a durability failure must not leave a
+    half-persisted file in the sandbox workspace."""
+
+    def _session(self):
+        from app.infra.config import get_settings
+        from app.infra.db import get_session_factory, reset_engine_for_tests
+
+        reset_engine_for_tests(get_settings().db_url)
+        return get_session_factory()()
+
+    def _user_conv(self, db):
+        from app.models import Conversation, User, new_id
+
+        user = User(id=new_id("usr"), email="up@example.com", password_hash="x")
+        db.add(user)
+        db.flush()
+        conv = Conversation(id=new_id("cnv"), user_id=user.id, title="t")
+        db.add(conv)
+        db.flush()
+        return user, conv
+
+    def test_durability_failure_unlinks_local_file(self) -> None:
+        import asyncio
+
+        from app.controllers import files
+        from app.infra.config import conversation_workspace
+        from app.infra.storage import StorageError
+
+        class _BrokenStorage:
+            def put_stream(self, key, stream):
+                raise StorageError("durable tier down")
+
+        async def _run(db, user, conv):
+            chunks = [b"partial-bytes", b""]
+
+            async def read_chunk(_n: int) -> bytes:
+                return chunks.pop(0)
+
+            await files.store_upload(
+                db,
+                user,
+                conv,
+                filename="x.csv",
+                read_chunk=read_chunk,
+                storage=_BrokenStorage(),
+            )
+
+        with self._session() as db:
+            user, conv = self._user_conv(db)
+            with pytest.raises(StorageError):
+                asyncio.run(_run(db, user, conv))
+            # no file left behind in the workspace, and no DB row committed
+            workspace = conversation_workspace(conv.id)
+            assert list(workspace.iterdir()) == []
+            from app.models import ConversationFile
+
+            assert db.query(ConversationFile).count() == 0
+
+    def test_success_persists_to_both_tiers(self) -> None:
+        import asyncio
+        from pathlib import Path
+
+        from app.controllers import files
+
+        class _MemStorage:
+            def __init__(self):
+                self.puts = {}
+
+            def put_stream(self, key, stream):
+                data = stream.read()
+                self.puts[key] = data
+                return len(data)
+
+        store = _MemStorage()
+
+        async def _run(db, user, conv):
+            chunks = [b"hello,world\n", b""]
+
+            async def read_chunk(_n: int) -> bytes:
+                return chunks.pop(0)
+
+            return await files.store_upload(
+                db, user, conv, filename="x.csv", read_chunk=read_chunk, storage=store
+            )
+
+        with self._session() as db:
+            user, conv = self._user_conv(db)
+            row = asyncio.run(_run(db, user, conv))
+            key = files.durable_key(conv.id, row.stored_name)
+            assert store.puts[key] == b"hello,world\n"  # durable tier
+            assert Path(row.path).read_bytes() == b"hello,world\n"  # sandbox tier
