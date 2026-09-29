@@ -239,9 +239,7 @@ def sync_artifacts(
     return synced
 
 
-def artifact_path(
-    conversation: Conversation, name: str, storage: Storage | None = None
-) -> Path:
+def artifact_path(conversation: Conversation, name: str, storage: Storage | None = None) -> Path:
     """On-disk path of one agent-produced file, rehydrating from durable
     storage if the local workspace copy is absent.
 
