@@ -139,7 +139,10 @@ session title), which says nothing about what the agent is doing.
 
 | var | default | note |
 |---|---|---|
-| `PAW_DB_URL` | `sqlite:///./paw.db` | any SQLAlchemy URL |
+| `PAW_DB_URL` | `sqlite:///./paw.db` | any SQLAlchemy URL (Postgres: `postgresql+psycopg://…`) |
+| `PAW_DB_POOL_SIZE` | `5` | connection pool size (server DBs; ignored for SQLite) |
+| `PAW_DB_MAX_OVERFLOW` | `10` | extra connections beyond the pool under load |
+| `PAW_DB_POOL_RECYCLE_S` | `1800` | recycle a pooled connection after N seconds |
 | `PAW_SECRET_KEY` | dev default | **set in production** |
 | `PAW_ACCESS_TOKEN_MINUTES` | `30` | JWT access TTL |
 | `PAW_REFRESH_TOKEN_DAYS` | `14` | JWT refresh TTL |
@@ -147,8 +150,29 @@ session title), which says nothing about what the agent is doing.
 | `PAW_HARNESS__CWD` | `""` | agent workspace dir per sandbox (overrides per-conversation workspaces) |
 | `PAW_WORKSPACE_ROOT` | `./workspaces` | base dir for per-conversation workspaces; uploads land in `<root>/<conversation_id>/` |
 | `PAW_HARNESS__TIMEOUT` | unset | host-side wall-clock budget for one run |
-| `PAW_RUNNER` | `server` | `server` only; docker later |
+| `PAW_RUNNER` | `server` | `server` (host subprocess) or `docker` (isolated container per sandbox) |
 | `PAW_SANDBOX__TTL_SECONDS` | `300` | idle reaper TTL |
+| `PAW_DOCKER__IMAGE` | `python-agent-harness:latest` | sandbox image (docker runner); pin by digest in prod |
+| `PAW_DOCKER__NETWORK` | `none` | container network mode; `none` = no egress |
+| `PAW_DOCKER__MEM_LIMIT` | `1g` | per-container memory ceiling |
+| `PAW_STORAGE__BACKEND` | `local` | durable blob store: `local` or `s3` |
+| `PAW_STORAGE__LOCAL_ROOT` | `./storage` | root dir for the `local` backend |
+| `PAW_STORAGE__S3_BUCKET` | `""` | bucket for the `s3` backend |
+| `PAW_STORAGE__S3_ENDPOINT_URL` | `""` | custom S3 endpoint (MinIO/localstack); empty = real AWS |
+| `PAW_BUDGET_ENFORCE` | `false` | enforce a per-user token budget before a run (spend kill-switch) |
+| `PAW_BUDGET_FREE_TOKENS` | `1000000` | free-tier token allowance per user |
+| `PAW_BUDGET_TOKENS_PER_POINT` | `1000` | token value of one account point (adds to the budget) |
+| `PAW_MAX_UPLOAD_BYTES` | `104857600` | per-file upload size cap (100 MB) |
+| `PAW_MAX_USER_STORAGE_BYTES` | `1073741824` | per-user total storage quota (1 GB); `0` = unlimited |
+| `PAW_UPLOAD_ALLOWED_TYPES` | `[]` | magic-byte allow-list (e.g. `["xlsx","csv","pdf"]`); empty = any type |
+| `PAW_RATE_LIMIT_BACKEND` | `memory` | `memory` (per-instance) or `redis` (shared/global across instances) |
+| `PAW_RATE_LIMIT_REDIS_URL` | `""` | Redis URL for the `redis` backend; empty = localhost default |
+| `PAW_SHUTDOWN_DRAIN_SECONDS` | `25` | on SIGTERM, seconds to let in-flight runs finish before exit |
+| `PAW_INSTANCE_ID` | host+pid | this instance's id (set to pod/task name); scopes run reconciliation |
+
+Metrics are exposed at `GET /metrics` (Prometheus text). Tracing spans
+are marked in the code and become real spans once a tracer is registered
+via `infra.metrics.set_tracer` (no-op otherwise).
 
 ## Design notes
 
