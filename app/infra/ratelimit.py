@@ -30,9 +30,11 @@ class RateLimiter(Protocol):
 
     def check(self, key: str, limit: int, window: float) -> tuple[bool, float]:
         """Record an attempt; return ``(allowed, retry_after_seconds)``."""
+        ...
 
     def reset(self) -> None:
         """Forget all counters (used to isolate tests)."""
+        ...
 
 
 class SlidingWindowLimiter:
