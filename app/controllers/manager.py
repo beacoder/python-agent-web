@@ -417,8 +417,7 @@ class Controller:
             still_running = sum(1 for t in self._workers.values() if t.is_alive())
         if still_running:
             _log.warning(
-                "drain: %d run(s) still in flight at deadline; "
-                "reconciled on next startup",
+                "drain: %d run(s) still in flight at deadline; reconciled on next startup",
                 still_running,
             )
         else:
