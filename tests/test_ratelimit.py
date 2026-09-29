@@ -129,3 +129,94 @@ def _reset_limiter():
     limiter.reset()
     yield
     limiter.reset()
+
+
+class TestBackendSelection:
+    def test_memory_is_default(self) -> None:
+        from app.infra.ratelimit import SlidingWindowLimiter, get_limiter, reset_limiter_for_tests
+
+        reset_limiter_for_tests()
+        assert isinstance(get_limiter(), SlidingWindowLimiter)
+
+    def test_redis_selected_by_config(self, monkeypatch) -> None:
+        from app.infra.ratelimit import RedisRateLimiter, get_limiter, reset_limiter_for_tests
+
+        monkeypatch.setenv("PAW_RATE_LIMIT_BACKEND", "redis")
+        get_settings.cache_clear()
+        reset_limiter_for_tests()
+        try:
+            # build fails to connect lazily only on use; construction is fine
+            assert isinstance(get_limiter(), RedisRateLimiter)
+        finally:
+            get_settings.cache_clear()
+            reset_limiter_for_tests()
+
+    def test_unknown_backend_raises(self, monkeypatch) -> None:
+        from app.infra.ratelimit import get_limiter, reset_limiter_for_tests
+
+        monkeypatch.setenv("PAW_RATE_LIMIT_BACKEND", "nope")
+        get_settings.cache_clear()
+        reset_limiter_for_tests()
+        try:
+            with pytest.raises(ValueError, match="unknown rate-limit backend"):
+                get_limiter()
+        finally:
+            get_settings.cache_clear()
+            reset_limiter_for_tests()
+
+
+class FakeRedis:
+    """Minimal in-memory stand-in for the redis client surface used by
+    RedisRateLimiter: an ``eval`` that mimics the Lua window script
+    atomically (single-threaded Python == atomic), plus scan_iter/delete."""
+
+    def __init__(self) -> None:
+        self.z: dict[str, list[tuple[float, str]]] = {}
+
+    def eval(self, script, numkeys, key, now, cutoff, limit, member, ttl):  # noqa: ARG002
+        now = float(now)
+        cutoff = float(cutoff)
+        limit = int(limit)
+        items = [(s, m) for (s, m) in self.z.get(key, []) if not (0 <= s <= cutoff)]
+        self.z[key] = items
+        if len(items) >= limit:
+            oldest = sorted(items)[0][0] if items else now
+            return [0, str(oldest)]
+        items.append((now, member))
+        return [1, "0"]
+
+    def scan_iter(self, match=None):  # noqa: ARG002
+        return list(self.z.keys())
+
+    def delete(self, key):
+        self.z.pop(key, None)
+
+
+class TestRedisRateLimiter:
+    def test_allows_under_limit_then_blocks(self) -> None:
+        from app.infra.ratelimit import RedisRateLimiter
+
+        limiter = RedisRateLimiter(client=FakeRedis())
+        # limit 2 per 60s: first two allowed, third blocked
+        assert limiter.check("k", 2, 60)[0] is True
+        assert limiter.check("k", 2, 60)[0] is True
+        allowed, retry = limiter.check("k", 2, 60)
+        assert allowed is False
+        assert retry > 0
+
+    def test_keys_are_independent(self) -> None:
+        from app.infra.ratelimit import RedisRateLimiter
+
+        limiter = RedisRateLimiter(client=FakeRedis())
+        assert limiter.check("a", 1, 60)[0] is True
+        assert limiter.check("b", 1, 60)[0] is True  # different key, own budget
+        assert limiter.check("a", 1, 60)[0] is False
+
+    def test_reset_clears(self) -> None:
+        from app.infra.ratelimit import RedisRateLimiter
+
+        limiter = RedisRateLimiter(client=FakeRedis())
+        limiter.check("k", 1, 60)
+        assert limiter.check("k", 1, 60)[0] is False
+        limiter.reset()
+        assert limiter.check("k", 1, 60)[0] is True
