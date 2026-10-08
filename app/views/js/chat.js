@@ -43,6 +43,14 @@ function el(tag, cls) {
   if (cls) d.className = cls;
   return d;
 }
+// Human text of an error payload: a plain string as-is, a structured
+// {code,message} unwrapped to its message (or code), anything else
+// stringified — so an error never renders as a raw JSON blob.
+function errText(data) {
+  if (typeof data === "string") return data;
+  if (data && (data.message || data.code)) return data.message || data.code;
+  return JSON.stringify(data);
+}
 function scrollMessages() {
   $("messages").scrollTop = $("messages").scrollHeight;
 }
@@ -248,7 +256,10 @@ function renderEvent(e, t, live = true) {
       renderTurnTodos(t, data);
     } else if (kind === "error") {
       const d = el("div", "msg err");
-      d.textContent = typeof data === "string" ? data : JSON.stringify(data);
+      // The harness sends a human string here, but tolerate a
+      // structured {code,message} payload too so an error never
+      // surfaces as a raw JSON blob.
+      d.textContent = errText(data);
       t.wrap.appendChild(d);
     } else if (kind === "retry") {
       dropSegment(t); // the partial output was discarded on retry

@@ -95,6 +95,111 @@ class TestApplyEvent:
         assert outcome.errors == []
         assert not outcome.saw_result
 
+    def test_result_structured_errors_fold_to_messages(self) -> None:
+        """The harness ships errors as [{code,message}] with a flat
+        error_messages mirror.  The trail must carry the messages, not
+        Python dict reprs."""
+        outcome = RunOutcome()
+        event = parse_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "answer": "",
+                    "errors": [{"code": "budget", "message": "Error: out of rounds"}],
+                    "error_messages": ["Error: out of rounds"],
+                    "cancelled": False,
+                }
+            )
+        )
+        assert event is not None
+        apply_event(outcome, event)
+        assert outcome.errors == ["Error: out of rounds"]
+        assert all("{" not in e for e in outcome.errors)
+
+    def test_result_errors_without_mirror_still_unwrap(self) -> None:
+        """If error_messages is absent, each {code,message} entry is
+        still unwrapped to its message rather than str(dict)."""
+        outcome = RunOutcome()
+        event = parse_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "answer": "",
+                    "errors": [{"code": "timeout", "message": "Error: too slow"}],
+                    "cancelled": False,
+                }
+            )
+        )
+        assert event is not None
+        apply_event(outcome, event)
+        assert outcome.errors == ["Error: too slow"]
+
+    def test_structured_notify_error_unwraps(self) -> None:
+        """An older harness may still send a dict on the notify line;
+        it must not surface as a repr."""
+        outcome = RunOutcome()
+        event = parse_line(
+            json.dumps(
+                {
+                    "type": "notify",
+                    "kind": "error",
+                    "data": {"code": "budget", "message": "Error: out of rounds"},
+                }
+            )
+        )
+        assert event is not None
+        apply_event(outcome, event)
+        assert outcome.errors == ["Error: out of rounds"]
+
+    def test_protocol_error_line_prefers_flat_message(self) -> None:
+        """The type:error line carries both a structured 'error' object
+        and a flat 'message'; the trail uses the message, not the dict."""
+        outcome = RunOutcome()
+        event = parse_line(
+            json.dumps(
+                {
+                    "type": "error",
+                    "error": {"code": "protocol", "message": "stale answer"},
+                    "message": "stale answer",
+                }
+            )
+        )
+        assert event is not None
+        apply_event(outcome, event)
+        assert outcome.errors == ["stale answer"]
+
+    def test_plain_string_errors_unchanged(self) -> None:
+        """Back-compat: the simplified string form still folds as-is."""
+        outcome = RunOutcome()
+        event = parse_line(
+            json.dumps({"type": "result", "answer": "done", "errors": ["e1"], "cancelled": False})
+        )
+        assert event is not None
+        apply_event(outcome, event)
+        assert outcome.errors == ["e1"]
+
+    def test_empty_message_error_still_signals_error(self) -> None:
+        """A (degenerate) error whose message resolves empty must not
+        be dropped: run_status keys off the list being non-empty, so
+        dropping it would silently turn an errored run into 'done'."""
+        from app.controllers.manager import run_status
+
+        outcome = RunOutcome()
+        event = parse_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "answer": "",
+                    "errors": [{}],  # no code, no message -> text is ""
+                    "cancelled": False,
+                }
+            )
+        )
+        assert event is not None
+        apply_event(outcome, event)
+        assert outcome.errors == [""]  # entry preserved, not dropped
+        assert run_status(outcome) == "error"  # NOT downgraded to "done"
+
 
 class TestParseStream:
     def test_multi_line(self) -> None:

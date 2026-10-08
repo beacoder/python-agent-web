@@ -81,34 +81,71 @@ def parse_line(line: str) -> ProtocolEvent | None:
     )
 
 
+def _error_text(value: Any) -> str:
+    """Human-readable text of one error entry.
+
+    The harness carries errors as ``{"code", "message"}`` objects (on
+    the ``result`` line and the protocol ``error`` line); a driver must
+    render the message, never ``str(dict)`` which leaks a Python repr
+    into the run's error trail.  A nested ``{"error": {...}}`` is
+    unwrapped; a message-less object falls back to its code; a plain
+    string passes through.  Mirrors the harness's own
+    ``error_display_text`` so both sides agree on the text.
+    """
+    if isinstance(value, dict):
+        inner = value.get("error")
+        if isinstance(inner, dict):
+            value = inner
+        return str(value.get("message") or value.get("code") or "")
+    return str(value)
+
+
 def apply_event(outcome: RunOutcome, event: ProtocolEvent) -> None:
     """Fold an event into the run outcome (result is canonical)."""
     if event.type == "result":
         outcome.saw_result = True
         outcome.answer = str(event.data.get("answer", ""))
-        errors = event.data.get("errors")
-        if isinstance(errors, list):
-            # the result line is canonical for its own errors, but must
-            # not wipe protocol errors folded from earlier lines (e.g.
-            # a rejected mid-run answer): merge, preserving order
-            for e in (str(e) for e in errors):
-                if e not in outcome.errors:
-                    outcome.errors.append(e)
+        # Prefer the flat "error_messages" mirror the harness emits
+        # alongside the structured "errors" precisely for drivers that
+        # do not parse the objects; fall back to extracting each
+        # entry's message.  Never str() a {"code","message"} dict —
+        # that leaks a Python repr into the run's error trail (and the
+        # DB).  Merge, preserving order and not wiping errors folded
+        # from earlier lines (e.g. a rejected mid-run answer).
+        messages = event.data.get("error_messages")
+        if not isinstance(messages, list):
+            errors = event.data.get("errors")
+            messages = [_error_text(e) for e in errors] if isinstance(errors, list) else []
+        # Do NOT drop empty entries: run_status keys off the list being
+        # non-empty, so filtering could turn a (degenerate) empty-message
+        # error into a "done" run — hiding a failure.  Map to text (never
+        # str(dict)) but preserve one trail entry per source error.
+        for m in (str(x) for x in messages):
+            if m not in outcome.errors:
+                outcome.errors.append(m)
         usage = event.data.get("usage")
         outcome.usage = dict(usage) if isinstance(usage, dict) else None
         outcome.model = event.data.get("model")
         outcome.cancelled = bool(event.data.get("cancelled", False))
     elif event.type == "notify" and event.data.get("kind") == "error":
-        message = event.data.get("data")
-        if message is not None and str(message) not in outcome.errors:
-            outcome.errors.append(str(message))
+        data = event.data.get("data")
+        if data is not None:
+            text = _error_text(data)
+            if text and text not in outcome.errors:
+                outcome.errors.append(text)
     elif event.type == "error":
         # harness protocol-level failure (unknown op, stale answer, a
         # cancel racing the run's finish): keep it in the run's error
-        # trail so it surfaces instead of vanishing
-        message = event.data.get("error")
-        if message is not None and str(message) not in outcome.errors:
-            outcome.errors.append(str(message))
+        # trail so it surfaces instead of vanishing.  Prefer the flat
+        # "message" sibling over the structured "error" object so the
+        # trail never carries a dict repr.
+        raw = event.data.get("message")
+        if raw is None:
+            raw = event.data.get("error")
+        if raw is not None:
+            text = _error_text(raw)
+            if text and text not in outcome.errors:
+                outcome.errors.append(text)
 
 
 def parse_stream(text: str) -> list[ProtocolEvent]:
