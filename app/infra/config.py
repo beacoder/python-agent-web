@@ -30,8 +30,33 @@ class HarnessSettings(BaseSettings):
     default and left to config inside the sandbox image."""
 
     max_rounds: int | None = None
-    """Reserved: not sent over the serve protocol today (serve runs
-    have no harness-side round budget)."""
+    """Cap EACH run at N LLM rounds, passed to ``serve --max-rounds``
+    at spawn.  None (the default) omits the flag entirely, leaving runs
+    unlimited exactly as before.
+
+    Budgets are deliberately spawn-time arguments rather than fields on
+    the submit op: ``serve`` sandboxes untrusted agent code on behalf
+    of this host, so the ceiling belongs to whoever starts the sandbox
+    and a run must not be able to raise its own."""
+
+    sandbox_timeout: float | None = None
+    """Per-run wall-clock budget enforced INSIDE the sandbox, passed to
+    ``serve --timeout`` at spawn.  Distinct from ``timeout`` above,
+    which is this host's own watchdog around the exec: the sandbox-side
+    budget is cooperative (checked between rounds) and ends the run
+    with a proper ``result`` line carrying real usage, where the
+    host-side one can only cancel and then kill.  None omits the flag,
+    leaving runs unlimited."""
+
+    answer_timeout: float | None = None
+    """How long the sandbox waits for a host answer to a mid-run
+    question before falling back to "Unanswered", passed to ``serve
+    --answer-timeout`` at spawn.  None omits the flag, which keeps the
+    harness default of waiting forever (a web user needs time to type).
+
+    Note that a non-None value makes answer correlation matter: once an
+    ask has timed out the harness refuses an ``answer`` that carries no
+    ``ask_id``, and this host does not send one yet."""
 
 
 class SandboxSettings(BaseSettings):
@@ -40,7 +65,19 @@ class SandboxSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PAW_SANDBOX__")
 
     ttl_seconds: float = 300.0
-    """Idle reaper TTL: a sandbox unused this long is destroyed."""
+    """Idle reaper TTL: a sandbox unused this long is destroyed.
+
+    Only ever applied to sandboxes with no live run (see
+    ``Runner.reap_idle``), so this bounds idleness, never a run."""
+
+    reap_interval_seconds: float = 60.0
+    """How often the background reaper looks for idle sandboxes.
+
+    Before this existed the reaper ran once at startup against a
+    freshly-empty in-memory registry, so ``ttl_seconds`` never applied
+    to anything and idle sandboxes leaked for the life of the process.
+    0 disables the background sweep (startup-only, the old no-op
+    behaviour)."""
 
 
 class StorageSettings(BaseSettings):
@@ -178,6 +215,18 @@ class Settings(BaseSettings):
     exiting.  Keep under the orchestrator's SIGTERM grace period so the
     drain completes before a forced kill; runs still in flight at the
     deadline are reconciled to ``error`` on the next startup."""
+
+    cancel_grace_seconds: float = 10.0
+    """After a USER cancels a run, how long to wait for the harness to
+    honour the protocol ``cancel`` before destroying the sandbox.
+
+    This is a recovery path, not a run budget: it is armed only by an
+    explicit cancel request and never by a timer, so a run nobody
+    cancels is still unlimited.  It exists because ``op:cancel`` is
+    cooperative — a run wedged in an uninterruptible tool ignores it,
+    and without escalation the row stays ``running`` forever, which the
+    partial unique index turns into a permanent lockout for that
+    conversation.  0 disables escalation (cancel stays best-effort)."""
 
     budget_enforce: bool = False
     """Enforce a per-user token budget before starting a run (the spend

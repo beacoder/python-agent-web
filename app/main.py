@@ -6,6 +6,8 @@ with ``uvicorn app.main:app`` — the minimal chat UI is served at ``/``.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 import uuid
 import warnings
@@ -18,7 +20,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .controllers.errors import DomainError
-from .controllers.manager import get_controller
+from .controllers.manager import Controller, get_controller
 from .infra.config import get_settings
 from .infra.db import get_engine
 from .infra.logging import configure_logging, get_logger, reset_request_id, set_request_id
@@ -33,12 +35,47 @@ async def lifespan(app: FastAPI):
     get_engine()  # migrate schema to head
     controller = get_controller()
     controller.reconcile_orphaned_runs()  # fail runs stranded by a restart
+    controller.reconcile_orphaned_sandboxes()  # retire this instance's dead sandbox rows
     controller.reap_idle_sandboxes()
-    yield
-    # graceful shutdown: stop taking new runs and let in-flight ones
-    # finish (bounded), so a deploy does not kill short runs mid-flight.
-    # Whatever does not finish in time is reconciled on the next start.
-    controller.drain(timeout=get_settings().shutdown_drain_seconds)
+    reaper = asyncio.create_task(_reap_idle_sandboxes_forever(controller))
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+        # graceful shutdown: stop taking new runs and let in-flight ones
+        # finish (bounded), so a deploy does not kill short runs mid-flight.
+        # Whatever does not finish in time is reconciled on the next start.
+        controller.drain(timeout=get_settings().shutdown_drain_seconds)
+
+
+async def _reap_idle_sandboxes_forever(controller: Controller) -> None:
+    """Sweep idle sandboxes on a timer for the life of the process.
+
+    The startup call alone could never reclaim anything: sandboxes live
+    in the runner's in-memory registry, so at startup it is empty and
+    the sweep is a guaranteed no-op — ``PAW_SANDBOX__TTL_SECONDS`` was
+    documented but never applied to a single sandbox, and idle ones
+    leaked until the process exited.
+
+    The sweep skips any sandbox with a live run (enforced in
+    ``Runner.reap_idle``), so it cannot shorten a run however long that
+    run takes.  Runs on a thread because reaping blocks on process
+    teardown and the DB.
+    """
+    interval = get_settings().sandbox.reap_interval_seconds
+    if interval <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            destroyed = await asyncio.to_thread(controller.reap_idle_sandboxes)
+        except Exception:  # noqa: BLE001 - the sweep must survive a bad pass
+            _log.warning("idle sandbox reaper failed", exc_info=True)
+            continue
+        if destroyed:
+            _log.info("reaped %d idle sandbox(es)", len(destroyed))
 
 
 def create_app() -> FastAPI:

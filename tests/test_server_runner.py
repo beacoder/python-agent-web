@@ -10,6 +10,7 @@ contract is covered by the harness repo's own suite (entry/server).
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -82,9 +83,277 @@ class TestLifecycle:
         assert runner.exists(fresh)
         runner.destroy(fresh)
 
+    def test_reap_idle_spares_a_sandbox_with_a_live_run(self, runner: ServerRunner) -> None:
+        """A live run must survive the reaper however idle it looks.
+
+        ``last_used`` is only touched when a run STARTS, so a long run
+        looks ever more idle while it works.  Reaping it would destroy
+        the resident process mid-run — killing the conversation's
+        history and the run's usage — which would make the idle TTL an
+        implicit run bound.
+        """
+        busy = runner.create("u", "c")
+        with runner._lock:
+            runner._sandboxes[busy]["last_used"] = 0.0  # maximally stale
+            runner._live_run[busy] = "run_live"
+
+        assert runner.reap_idle(ttl_seconds=60) == []
+        assert runner.exists(busy)
+
+        # once the run ends, the same sandbox is reapable
+        with runner._lock:
+            runner._live_run[busy] = None
+        assert runner.reap_idle(ttl_seconds=60) == [busy]
+        assert not runner.exists(busy)
+
+
+class TestServeBudgetFlags:
+    """Spawn-time budget flags: present only when configured.
+
+    The harness refuses to read budgets off the wire (a submit must not
+    be able to raise its own ceiling), so the spawn command line is the
+    only place an operator can set them.  Defaults must stay unlimited.
+    """
+
+    def test_default_command_carries_no_budget_flags(self, runner: ServerRunner) -> None:
+        cmd = runner._command()
+        assert cmd[-1] == "serve"
+        for flag in ("--max-rounds", "--timeout", "--answer-timeout"):
+            assert flag not in cmd
+
+    def test_configured_budgets_become_flags(self, runner: ServerRunner) -> None:
+        runner._harness.max_rounds = 12
+        runner._harness.sandbox_timeout = 90.0
+        runner._harness.answer_timeout = 30.0
+        cmd = runner._command()
+        assert cmd[cmd.index("--max-rounds") + 1] == "12"
+        assert cmd[cmd.index("--timeout") + 1] == "90.0"
+        assert cmd[cmd.index("--answer-timeout") + 1] == "30.0"
+        assert cmd.index("serve") < cmd.index("--max-rounds")
+
+    def test_flags_are_independent(self, runner: ServerRunner) -> None:
+        runner._harness.max_rounds = 5
+        cmd = runner._command()
+        assert "--max-rounds" in cmd
+        assert "--timeout" not in cmd
+        assert "--answer-timeout" not in cmd
+
+    def test_zero_is_normalized_to_omitted(self, runner: ServerRunner) -> None:
+        """0 means "unlimited" to the harness, so emit nothing.
+
+        Passing ``--max-rounds 0`` through would read like a ceiling of
+        zero on a process listing while actually meaning the opposite,
+        and would break if a future harness gave 0 a meaning.
+        """
+        runner._harness.max_rounds = 0
+        runner._harness.sandbox_timeout = 0
+        runner._harness.answer_timeout = 0
+        assert runner._command() == [*shlex.split(runner._harness.cmd), "serve"]
+
+    def test_host_timeout_is_not_a_sandbox_flag(self, runner: ServerRunner) -> None:
+        """``harness.timeout`` is this host's watchdog, not the sandbox's.
+
+        Passing it through as ``--timeout`` would silently duplicate the
+        budget and change what the existing setting means.
+        """
+        runner._harness.timeout = 42.0
+        assert "--timeout" not in runner._command()
+
+    def test_a_spawned_process_accepts_the_flags(self, tmp_path) -> None:
+        """The flag names must be ones ``serve`` actually parses."""
+        script = tmp_path / "flagcheck.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import argparse, json, sys
+                p = argparse.ArgumentParser()
+                p.add_argument("command")
+                p.add_argument("--answer-timeout", type=float, default=0.0)
+                p.add_argument("--max-rounds", type=int, default=None)
+                p.add_argument("--timeout", type=float, default=None)
+                a = p.parse_args()
+                sys.stdout.write(json.dumps({"type": "ready", "argv": vars(a)}) + "\\n")
+                sys.stdout.flush()
+                sys.stdin.readline()
+                """
+            )
+        )
+        runner = ServerRunner()
+        runner._harness.cmd = f"{sys.executable} {script}"
+        runner._harness.max_rounds = 7
+        runner._harness.sandbox_timeout = 15.0
+        runner._harness.answer_timeout = 5.0
+        sandbox = runner.create("u", "c")
+        try:
+            proc = runner._procs[sandbox]
+            payload = json.loads(proc.stdout.readline())
+            assert payload["argv"] == {
+                "command": "serve",
+                "answer_timeout": 5.0,
+                "max_rounds": 7,
+                "timeout": 15.0,
+            }
+        finally:
+            runner.destroy(sandbox)
+
     def test_unknown_sandbox_raises(self, runner: ServerRunner) -> None:
         with pytest.raises(SandboxNotFoundError):
             runner.exec_run("sbx_missing", "hi", "run_1")
+
+    def test_destroy_if_running_requires_ownership(self, runner: ServerRunner) -> None:
+        """Teardown-on-ignored-cancel must be guarded by ownership.
+
+        The sandbox is resident, so the cancelled run can finalize and
+        the conversation's next turn can claim the same sandbox before
+        escalation fires; a blind destroy would kill that successor.
+        """
+        sandbox = runner.create("u", "c")
+        with runner._lock:
+            runner._live_run[sandbox] = "run_a"
+
+        # a different run owns it now -> decline, leave it alone
+        assert runner.destroy_if_running(sandbox, "run_stale") is False
+        assert runner.exists(sandbox)
+        # nothing owns it -> also declined (there is nothing to release)
+        with runner._lock:
+            runner._live_run[sandbox] = None
+        assert runner.destroy_if_running(sandbox, "run_a") is False
+        assert runner.exists(sandbox)
+        # the owner asks -> torn down
+        with runner._lock:
+            runner._live_run[sandbox] = "run_a"
+        assert runner.destroy_if_running(sandbox, "run_a") is True
+        assert not runner.exists(sandbox)
+
+    def test_destroy_if_running_on_unknown_sandbox_is_a_noop(self, runner: ServerRunner) -> None:
+        assert runner.destroy_if_running("sbx_missing", "run_a") is False
+
+    def test_claim_live_run_reports_a_destroyed_sandbox(self, runner: ServerRunner) -> None:
+        """Claiming must fail loudly rather than register a dead sandbox.
+
+        ``_live_run``'s keys have to stay a subset of ``_sandboxes``':
+        a key for a sandbox with no meta is never cleaned up (nothing
+        will destroy that id again) and would be a slow leak.
+        """
+        sandbox = runner.create("u", "c")
+        runner.destroy(sandbox)
+        with pytest.raises(SandboxNotFoundError):
+            runner._claim_live_run(sandbox, "run_1")
+        assert sandbox not in runner._live_run
+
+    def test_release_live_run_does_not_resurrect_a_dead_sandbox(self, runner: ServerRunner) -> None:
+        sandbox = runner.create("u", "c")
+        runner._claim_live_run(sandbox, "run_1")
+        runner.destroy(sandbox)  # pops the slot along with everything else
+        runner._release_live_run(sandbox)  # the exec's finally, after the fact
+        assert sandbox not in runner._live_run
+
+    def test_exec_on_a_sandbox_destroyed_just_before_the_claim(self, runner: ServerRunner) -> None:
+        """The real path for the above: the sandbox can be destroyed
+        between ``exec_lock`` being taken and the live-run claim (an
+        escalated cancel, a sweep)."""
+        sandbox = runner.create("u", "c")
+        original = runner.touch
+
+        def _destroy_then_touch(sandbox_id: str) -> None:
+            runner.destroy(sandbox_id)  # vanishes right before the claim
+            original(sandbox_id)
+
+        runner.touch = _destroy_then_touch
+        with pytest.raises(SandboxNotFoundError):
+            runner.exec_run(sandbox, "hi", "run_1")
+        assert runner._live_run == {}  # no leaked slot
+
+    def test_reap_loses_to_a_concurrent_claim(self, runner: ServerRunner) -> None:
+        """A claim that lands mid-sweep keeps its sandbox.
+
+        The staleness decision is re-made inside the lock that removes
+        the sandbox, so a run which claimed (and touched) a stale
+        sandbox cannot have it torn out from under it.  Checking first
+        and tearing down afterwards left exactly that window — and it
+        opened on the request that revived an idle conversation, since
+        such a sandbox is stale by definition.
+        """
+        sandbox = runner.create("u", "c")
+        with runner._lock:
+            runner._sandboxes[sandbox]["last_used"] = 0.0  # stale
+
+        # simulate the claim landing between the check and the teardown
+        original = runner._detach_if_idle
+
+        def _claim_then_detach(sandbox_id, ttl_seconds, now):
+            runner.touch(sandbox_id)  # a run claims it right now
+            return original(sandbox_id, ttl_seconds, now)
+
+        runner._detach_if_idle = _claim_then_detach
+        try:
+            assert runner.reap_idle(ttl_seconds=60) == []
+            assert runner.exists(sandbox)  # the claim won
+        finally:
+            runner._detach_if_idle = original
+            runner.destroy(sandbox)
+
+    def test_reap_still_collects_a_genuinely_idle_sandbox(self, runner: ServerRunner) -> None:
+        """The atomic re-check must not make the reaper a no-op."""
+        sandbox = runner.create("u", "c")
+        with runner._lock:
+            runner._sandboxes[sandbox]["last_used"] = 0.0
+        assert runner.reap_idle(ttl_seconds=60) == [sandbox]
+        assert not runner.exists(sandbox)
+
+    def test_reap_collects_a_sandbox_whose_spawn_failed(self, tmp_path) -> None:
+        """A sandbox with no process is still reapable (not skipped as
+        'nothing detached')."""
+        runner = ServerRunner()
+        runner._harness.cmd = str(tmp_path / "does-not-exist")
+        sandbox = runner.create("u", "c")  # spawn fails, meta still registered
+        assert runner._procs.get(sandbox) is None
+        with runner._lock:
+            runner._sandboxes[sandbox]["last_used"] = 0.0
+        assert runner.reap_idle(ttl_seconds=60) == [sandbox]
+        assert not runner.exists(sandbox)
+
+    def test_destroy_tears_down_a_process_with_no_meta(self, runner: ServerRunner) -> None:
+        """``destroy`` must clear every map, not bail on a missing meta.
+
+        The maps can briefly disagree -- a respawn registers a process
+        while a concurrent sweep removes the meta -- and a destroy that
+        skipped the teardown in that state would leak the process for
+        the life of the web process.
+        """
+        sandbox = runner.create("u", "c")
+        proc = runner._procs[sandbox]
+        with runner._lock:
+            runner._sandboxes.pop(sandbox)  # meta gone, process still registered
+        runner.destroy(sandbox)
+        assert runner._procs.get(sandbox) is None
+        assert proc.wait(timeout=10) is not None  # actually stopped
+
+    def test_respawn_onto_a_vanished_sandbox_leaves_no_orphan(self, runner: ServerRunner) -> None:
+        """A sandbox destroyed during the ready handshake must not end up
+        with a re-registered process nothing owns.
+
+        The live-run slot is only claimed after the handshake, so a
+        sweep or an explicit destroy can still take the sandbox while a
+        respawn is in flight.  Re-registering then would leave a
+        process in ``_procs`` with no meta.
+        """
+        sandbox = runner.create("u", "c")
+        runner._procs[sandbox].kill()  # dead process -> exec_run respawns
+        runner._procs[sandbox].wait(timeout=10)
+
+        original = runner._read_ready
+
+        def _read_ready_then_vanish(proc, timeout=30.0):
+            ok = original(proc, timeout)
+            with runner._lock:
+                runner._sandboxes.pop(sandbox, None)  # swept mid-handshake
+            return ok
+
+        runner._read_ready = _read_ready_then_vanish
+        with pytest.raises(SandboxNotFoundError):
+            runner.exec_run(sandbox, "hi", "run_1")
+        assert runner._procs.get(sandbox) is None  # no orphan under that id
 
     def test_destroy_kills_process(self, runner: ServerRunner) -> None:
         sandbox = runner.create("u", "c")

@@ -205,9 +205,72 @@ class TestLifecycle:
         assert runner.exists(fresh)
         runner.destroy(fresh)
 
+    def test_reap_idle_spares_a_sandbox_with_a_live_run(self, runner: DockerRunner) -> None:
+        """Mirrors ServerRunner: the idle TTL must never bound a run."""
+        busy = runner.create("u", "c")
+        with runner._lock:
+            runner._sandboxes[busy]["last_used"] = 0.0
+            runner._live_run[busy] = "run_live"
+        assert runner.reap_idle(ttl_seconds=60) == []
+        assert runner.exists(busy)
+        with runner._lock:
+            runner._live_run[busy] = None
+        assert runner.reap_idle(ttl_seconds=60) == [busy]
+
     def test_unknown_sandbox_raises(self, runner: DockerRunner) -> None:
         with pytest.raises(SandboxNotFoundError):
             runner.exec_run("sbx_missing", "hi", "run_1")
+
+    def test_destroy_if_running_requires_ownership(self, runner: DockerRunner) -> None:
+        """Mirrors ServerRunner: escalation must not kill a successor."""
+        sandbox = runner.create("u", "c")
+        with runner._lock:
+            runner._live_run[sandbox] = "run_a"
+        assert runner.destroy_if_running(sandbox, "run_stale") is False
+        assert runner.exists(sandbox)
+        assert runner.destroy_if_running(sandbox, "run_a") is True
+        assert not runner.exists(sandbox)
+        assert runner.destroy_if_running("sbx_missing", "run_a") is False
+
+    def test_live_run_slot_never_outlives_the_sandbox(self, runner: DockerRunner) -> None:
+        sandbox = runner.create("u", "c")
+        runner.destroy(sandbox)
+        with pytest.raises(SandboxNotFoundError):
+            runner._claim_live_run(sandbox, "run_1")
+        runner._release_live_run(sandbox)
+        assert sandbox not in runner._live_run
+
+    def test_respawn_onto_a_vanished_sandbox_leaves_no_orphan(
+        self, runner: DockerRunner, client: FakeClient
+    ) -> None:
+        """Mirrors ServerRunner: a sandbox destroyed during the ready
+        handshake must not get its container re-registered.
+
+        The live-run slot is only claimed after the handshake, so a
+        sweep or an escalated cancel can still take the sandbox while
+        the respawn is in flight; re-registering would leave container
+        and stream handles with no meta.
+        """
+        sandbox = runner.create("u", "c")
+        client.containers.created[0].status = "exited"  # dead -> exec respawns
+
+        original = runner._read_ready
+
+        def _read_ready_then_vanish(stream, timeout=30.0):
+            ok = original(stream, timeout)
+            with runner._lock:
+                runner._sandboxes.pop(sandbox, None)  # swept mid-handshake
+            return ok
+
+        runner._read_ready = _read_ready_then_vanish
+        with pytest.raises(SandboxNotFoundError):
+            runner.exec_run(sandbox, "hi", "run_1")
+
+        assert runner._containers.get(sandbox) is None
+        assert runner._streams.get(sandbox) is None
+        assert sandbox not in runner._live_run
+        # the container started for the doomed respawn was torn back down
+        assert client.containers.created[-1].removed is True
 
 
 class TestExecRun:
@@ -306,6 +369,26 @@ class TestIsolation:
         assert kwargs["pids_limit"] > 0
         assert kwargs["mem_limit"]
         assert kwargs["nano_cpus"] > 0
+
+    def test_command_has_no_budget_flags_by_default(
+        self, runner: DockerRunner, client: FakeClient
+    ) -> None:
+        assert self._create_kwargs(runner, client)["command"] == ["serve"]
+
+    def test_configured_budgets_reach_the_container_command(
+        self, runner: DockerRunner, client: FakeClient, monkeypatch
+    ) -> None:
+        """The sandbox-side ceiling must be set by whoever starts the
+        sandbox; for the docker runner that is the container command."""
+        from app.infra.config import get_settings
+
+        monkeypatch.setattr(get_settings().harness, "max_rounds", 9)
+        monkeypatch.setattr(get_settings().harness, "sandbox_timeout", 120.0)
+        command = self._create_kwargs(runner, client)["command"]
+        assert command[0] == "serve"
+        assert command[command.index("--max-rounds") + 1] == "9"
+        assert command[command.index("--timeout") + 1] == "120.0"
+        assert "--answer-timeout" not in command
 
     def test_secret_source_failure_does_not_brick_create(self, client: FakeClient) -> None:
         def _boom(uid: str) -> dict:

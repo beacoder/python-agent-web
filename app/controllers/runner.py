@@ -64,6 +64,35 @@ class SandboxNotFoundError(KeyError):
     pass
 
 
+def serve_flags(harness: HarnessSettings) -> list[str]:
+    """Sandbox-side budget flags for ``harness serve``, from settings.
+
+    Each flag is emitted ONLY when its setting is non-None, so the
+    default configuration produces an empty list and the spawn command
+    is byte-identical to one with no budgets at all — runs stay
+    unlimited unless an operator opts in.
+
+    These are spawn-time arguments on purpose.  The harness refuses to
+    take budgets off the wire (a submit cannot raise its own ceiling),
+    so the only way to give an operator the knob is here, at the point
+    where the trusted side starts the sandbox.
+
+    A 0/negative setting is normalized to "omit the flag" rather than
+    passed through.  The harness reads 0 as "explicitly disable", so
+    both mean unlimited -- but ``--max-rounds 0`` on a process listing
+    reads like a ceiling of zero, and omitting it cannot be
+    misinterpreted by a future harness that gives 0 a meaning.
+    """
+    flags: list[str] = []
+    if harness.max_rounds is not None and harness.max_rounds > 0:
+        flags += ["--max-rounds", str(int(harness.max_rounds))]
+    if harness.sandbox_timeout is not None and harness.sandbox_timeout > 0:
+        flags += ["--timeout", str(float(harness.sandbox_timeout))]
+    if harness.answer_timeout is not None and harness.answer_timeout > 0:
+        flags += ["--answer-timeout", str(float(harness.answer_timeout))]
+    return flags
+
+
 class Runner:
     """Sandbox-manager interface (see README architecture)."""
 
@@ -72,6 +101,49 @@ class Runner:
 
     def destroy(self, sandbox_id: str) -> None:
         raise NotImplementedError
+
+    def destroy_if_running(self, sandbox_id: str, run_id: str) -> bool:
+        """Destroy the sandbox only while *run_id* is still its live run.
+
+        The escalation path for an ignored cancel.  Checking ownership
+        atomically with the teardown matters because the sandbox is
+        resident: by the time escalation fires, the cancelled run may
+        have finalized and the conversation's NEXT turn may already own
+        the same sandbox, and tearing it down then would kill an
+        innocent successor run.
+
+        Returns False when the sandbox has moved on (nothing done).
+        Defaults to an unconditional destroy, since a runner that keeps
+        no live-run slot cannot tell the difference.
+        """
+        self.destroy(sandbox_id)
+        return True
+
+    def touch(self, sandbox_id: str) -> None:
+        """Mark the sandbox as used now, resetting its idle age.
+
+        Called when a run CLAIMS a sandbox, not only when it starts
+        executing in it: the claim happens on the request thread while
+        the exec happens later on a worker, and in between the idle
+        reaper is free to destroy a sandbox that is stale by age — which
+        is exactly the state of a sandbox whose conversation the user is
+        returning to.  Touching at claim time keeps the reaper off it.
+
+        No-op by default (a runner with no idle tracking has nothing to
+        reset).
+        """
+
+    def exists(self, sandbox_id: str) -> bool:
+        """Whether this runner still holds live state for *sandbox_id*.
+
+        The sandbox registry in the DB outlives the process that owned
+        the sandbox, so a stored ``running`` row is only trustworthy if
+        the runner still backs it.  Defaults to True: a runner that
+        keeps no per-sandbox state cannot contradict the registry, so
+        the row is trusted (the historical behaviour).  The resident
+        runners override this with their real in-memory view.
+        """
+        return True
 
     def exec_run(
         self,
@@ -89,7 +161,15 @@ class Runner:
         return False
 
     def reap_idle(self, ttl_seconds: float) -> list[str]:
-        """Destroy sandboxes idle longer than TTL; return destroyed ids."""
+        """Destroy sandboxes idle longer than TTL; return destroyed ids.
+
+        Implementations MUST skip a sandbox with a live run regardless
+        of its idle age: ``last_used`` is only touched when a run
+        starts, so a long run looks increasingly idle while it is
+        working, and reaping it would kill the resident process
+        mid-run — losing the conversation's history and the run's
+        usage.  The TTL bounds idleness; it must never bound a run.
+        """
         raise NotImplementedError
 
 
@@ -127,6 +207,7 @@ class ServerRunner(Runner):
     def _command(self) -> list[str]:
         cmd = shlex.split(self._harness.cmd)
         cmd += ["serve"]
+        cmd += serve_flags(self._harness)
         return cmd
 
     def _workspace_dir(self, conversation_id: str) -> str:
@@ -205,29 +286,113 @@ class ServerRunner(Runner):
 
         threading.Thread(target=_drain, daemon=True, name="serve-stderr").start()
 
-    def destroy(self, sandbox_id: str) -> None:
+    def _detach(self, sandbox_id: str) -> subprocess.Popen | None:
+        """Remove all registry state for the sandbox, under the lock.
+
+        Returns the process to tear down, or None when there was none.
+        Split out so the decision to retire a sandbox and its removal
+        from the registry are a single atomic step -- see
+        ``_detach_if_idle``.
+
+        Clears every map unconditionally rather than bailing out when
+        the meta is already gone: the maps can briefly disagree (a
+        respawn re-registers a process while a concurrent sweep removes
+        the meta), and a ``destroy`` that skipped the teardown in that
+        state would leak the process for good.
+        """
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
             proc = self._procs.pop(sandbox_id, None)
             self._locks.pop(sandbox_id, None)
             self._live_run.pop(sandbox_id, None)
             self._exec_locks.pop(sandbox_id, None)
-        if proc is not None:
-            # graceful first (stdin close ends serve_forever), then kill
-            with contextlib.suppress(ValueError, OSError):
-                if proc.stdin is not None:
-                    proc.stdin.close()
-            try:
+        return proc
+
+    def _detach_if(self, sandbox_id: str, predicate: Any) -> tuple[bool, subprocess.Popen | None]:
+        """Detach only when ``predicate(meta, live_run_id)`` holds.
+
+        Returns ``(detached, proc)``; ``detached`` is False when the
+        sandbox was left alone, which is distinct from detaching one
+        that simply had no process (a failed spawn at create).
+
+        The predicate is evaluated INSIDE the lock that removes the
+        sandbox.  That is what makes retiring a sandbox safe against a
+        concurrent claim: deciding first and tearing down afterwards
+        left a window in which the sandbox could change hands between
+        the decision and the teardown.
+        """
+        with self._lock:
+            meta = self._sandboxes.get(sandbox_id)
+            if meta is None or not predicate(meta, self._live_run.get(sandbox_id)):
+                return False, None
+            self._sandboxes.pop(sandbox_id, None)
+            proc = self._procs.pop(sandbox_id, None)
+            self._locks.pop(sandbox_id, None)
+            self._live_run.pop(sandbox_id, None)
+            self._exec_locks.pop(sandbox_id, None)
+        return True, proc
+
+    def _detach_if_idle(
+        self, sandbox_id: str, ttl_seconds: float, now: float
+    ) -> tuple[bool, subprocess.Popen | None]:
+        """``_detach``, but only while the sandbox is idle AND stale.
+
+        A live run is spared regardless of age: ``last_used`` is only
+        touched when a run starts, so a long run looks ever more idle
+        while it works, and tearing it down would kill it mid-run.
+        """
+        return self._detach_if(
+            sandbox_id,
+            lambda meta, live: (
+                live is None and now - float(meta.get("last_used", 0.0)) > ttl_seconds
+            ),
+        )
+
+    def _claim_live_run(self, sandbox_id: str, run_id: str) -> None:
+        """Take the sandbox's live-run slot, or report it gone.
+
+        The sandbox can be destroyed between ``exec_lock`` being taken
+        and the claim (an escalated cancel, a sweep).  Writing the slot
+        blindly would re-add a ``_live_run`` key for a sandbox with no
+        meta, breaking the invariant that ``_live_run``'s keys are a
+        subset of ``_sandboxes``' -- and leaking the entry, since
+        nothing will ever destroy that id again.
+        """
+        with self._lock:
+            if sandbox_id not in self._sandboxes:
+                raise SandboxNotFoundError(sandbox_id)
+            self._live_run[sandbox_id] = run_id
+
+    def _release_live_run(self, sandbox_id: str) -> None:
+        """Free the live-run slot, without resurrecting a dead sandbox."""
+        with self._lock:
+            if sandbox_id in self._sandboxes:
+                self._live_run[sandbox_id] = None
+            else:
+                self._live_run.pop(sandbox_id, None)
+
+    def _teardown(self, proc: subprocess.Popen | None) -> None:
+        """Stop a detached process: graceful stdin close, then kill."""
+        if proc is None:
+            return
+        # graceful first (stdin close ends serve_forever), then kill
+        with contextlib.suppress(ValueError, OSError):
+            if proc.stdin is not None:
+                proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=5)
-            for stream in (proc.stdout, proc.stderr):
-                if stream is None:  # pragma: no cover - Popen with PIPE
-                    continue
-                with contextlib.suppress(ValueError, OSError):
-                    stream.close()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is None:  # pragma: no cover - Popen with PIPE
+                continue
+            with contextlib.suppress(ValueError, OSError):
+                stream.close()
+
+    def destroy(self, sandbox_id: str) -> None:
+        self._teardown(self._detach(sandbox_id))
 
     def exists(self, sandbox_id: str) -> bool:
         with self._lock:
@@ -250,6 +415,19 @@ class ServerRunner(Runner):
         self.touch(sandbox_id)
         return self._send(proc, lock, {"op": "cancel", "run_id": run_id})
 
+    def destroy_if_running(self, sandbox_id: str, run_id: str) -> bool:
+        """Destroy the sandbox only while *run_id* still owns it.
+
+        Ownership is checked inside the lock that removes the sandbox,
+        so the sandbox cannot change hands between the check and the
+        teardown — which is the whole point, since the cancelled run
+        may finalize and the conversation's next turn may claim the
+        same resident sandbox at any moment.
+        """
+        detached, proc = self._detach_if(sandbox_id, lambda meta, live: live == run_id)
+        self._teardown(proc)
+        return detached
+
     def deliver_answer(self, sandbox_id: str, run_id: str, answers: list[str]) -> bool:
         """Deliver the user's answer to a pending mid-run question.
 
@@ -271,11 +449,19 @@ class ServerRunner(Runner):
         now = time.time()
         destroyed: list[str] = []
         with self._lock:
-            for sandbox_id, meta in list(self._sandboxes.items()):
-                if now - float(meta.get("last_used", 0.0)) > ttl_seconds:
-                    destroyed.append(sandbox_id)
-        for sandbox_id in destroyed:
-            self.destroy(sandbox_id)
+            candidates = list(self._sandboxes)
+        for sandbox_id in candidates:
+            # The idle/stale decision is re-made INSIDE the lock that
+            # removes the sandbox (see _detach_if_idle), so a run that
+            # claims and touches a stale sandbox concurrently keeps it.
+            # A live run is skipped regardless of age: last_used is only
+            # touched at run start, so a long run looks ever MORE idle
+            # while it works, and tearing it down would kill it mid-run.
+            detached, proc = self._detach_if_idle(sandbox_id, ttl_seconds, now)
+            if not detached:
+                continue
+            destroyed.append(sandbox_id)
+            self._teardown(proc)
         return destroyed
 
     # -- process I/O --------------------------------------------------------
@@ -389,9 +575,23 @@ class ServerRunner(Runner):
                     exit_code=None, stdout="", stderr="harness process died before ready"
                 )
             with self._lock:
-                self._procs[sandbox_id] = proc
-                self._locks[sandbox_id] = threading.Lock()
-                lock = self._locks[sandbox_id]
+                vanished = sandbox_id not in self._sandboxes
+                if not vanished:
+                    self._procs[sandbox_id] = proc
+                    self._locks[sandbox_id] = threading.Lock()
+                    lock = self._locks[sandbox_id]
+            if vanished:
+                # The sandbox was destroyed while we were spawning and
+                # waiting for `ready` (the live-run slot is only claimed
+                # below, so a sweep or an explicit destroy could still
+                # take it).  Re-registering here would leave a process
+                # in _procs with no meta -- an entry nothing owns.  Tear
+                # down the process we just started, clear any leftover
+                # entries for the id, and report the sandbox as gone;
+                # the caller retires the row and the next turn rebuilds.
+                self._teardown(proc)
+                self._teardown(self._detach(sandbox_id))
+                raise SandboxNotFoundError(sandbox_id)
             # the freshly respawned process has now passed its ready
             # handshake; mark it so a later exec on this live process does
             # not call _read_ready again (its single ready line is gone,
@@ -407,8 +607,7 @@ class ServerRunner(Runner):
         # stderr diagnostics: snapshot position in the per-process
         # drainer's buffer, so this exec only reports ITS OWN stderr
         err_from = len(meta["stderr_log"])
-        with self._lock:
-            self._live_run[sandbox_id] = run_id
+        self._claim_live_run(sandbox_id, run_id)
         try:
             if proc.poll() is not None or not self._send(
                 proc, lock, {"op": "submit", "prompt": prompt, "run_id": run_id}
@@ -435,8 +634,7 @@ class ServerRunner(Runner):
                     or "harness process died mid-run",
                 )
         finally:
-            with self._lock:
-                self._live_run[sandbox_id] = None
+            self._release_live_run(sandbox_id)
         return ExecResult(
             exit_code=0 if not timed_out else None,
             stdout="".join(stdout_lines),
@@ -663,7 +861,7 @@ class DockerRunner(Runner):
         d = get_settings().docker
         return {
             "image": d.image,
-            "command": ["serve"],
+            "command": ["serve", *serve_flags(get_settings().harness)],
             "environment": self._container_env(meta["user_id"]),
             "working_dir": d.workdir,
             "volumes": {meta["workspace"]: {"bind": d.workdir, "mode": "rw"}},
@@ -727,7 +925,8 @@ class DockerRunner(Runner):
             return False
         return getattr(container, "status", None) == "running"
 
-    def destroy(self, sandbox_id: str) -> None:
+    def _detach(self, sandbox_id: str) -> tuple[Any, _DockerStream | None]:
+        """Remove all registry state for the sandbox, under the lock."""
         with self._lock:
             self._sandboxes.pop(sandbox_id, None)
             container = self._containers.pop(sandbox_id, None)
@@ -735,6 +934,55 @@ class DockerRunner(Runner):
             self._locks.pop(sandbox_id, None)
             self._live_run.pop(sandbox_id, None)
             self._exec_locks.pop(sandbox_id, None)
+        return container, stream
+
+    def _detach_if(self, sandbox_id: str, predicate: Any) -> tuple[bool, Any, _DockerStream | None]:
+        """Detach only when ``predicate(meta, live_run_id)`` holds.
+
+        Mirrors ``ServerRunner._detach_if``: the predicate runs inside
+        the lock that removes the sandbox, so it cannot change hands
+        between the decision and the teardown.
+        """
+        with self._lock:
+            meta = self._sandboxes.get(sandbox_id)
+            if meta is None or not predicate(meta, self._live_run.get(sandbox_id)):
+                return False, None, None
+            self._sandboxes.pop(sandbox_id, None)
+            container = self._containers.pop(sandbox_id, None)
+            stream = self._streams.pop(sandbox_id, None)
+            self._locks.pop(sandbox_id, None)
+            self._live_run.pop(sandbox_id, None)
+            self._exec_locks.pop(sandbox_id, None)
+        return True, container, stream
+
+    def _detach_if_idle(
+        self, sandbox_id: str, ttl_seconds: float, now: float
+    ) -> tuple[bool, Any, _DockerStream | None]:
+        """``_detach``, but only while idle AND stale (see ServerRunner)."""
+        return self._detach_if(
+            sandbox_id,
+            lambda meta, live: (
+                live is None and now - float(meta.get("last_used", 0.0)) > ttl_seconds
+            ),
+        )
+
+    def _claim_live_run(self, sandbox_id: str, run_id: str) -> None:
+        """Take the live-run slot, or report the sandbox gone."""
+        with self._lock:
+            if sandbox_id not in self._sandboxes:
+                raise SandboxNotFoundError(sandbox_id)
+            self._live_run[sandbox_id] = run_id
+
+    def _release_live_run(self, sandbox_id: str) -> None:
+        """Free the live-run slot, without resurrecting a dead sandbox."""
+        with self._lock:
+            if sandbox_id in self._sandboxes:
+                self._live_run[sandbox_id] = None
+            else:
+                self._live_run.pop(sandbox_id, None)
+
+    def _teardown(self, container: Any, stream: _DockerStream | None) -> None:
+        """Stop and remove a detached container."""
         if stream is not None:
             stream.close()
         if container is not None:
@@ -743,6 +991,9 @@ class DockerRunner(Runner):
                 container.stop(timeout=timeout)
             with contextlib.suppress(Exception):
                 container.remove(force=True)
+
+    def destroy(self, sandbox_id: str) -> None:
+        self._teardown(*self._detach(sandbox_id))
 
     def exists(self, sandbox_id: str) -> bool:
         with self._lock:
@@ -763,6 +1014,12 @@ class DockerRunner(Runner):
         self.touch(sandbox_id)
         return self._send(stream, lock, {"op": "cancel", "run_id": run_id})
 
+    def destroy_if_running(self, sandbox_id: str, run_id: str) -> bool:
+        """Destroy the container only while *run_id* still owns it."""
+        detached, container, stream = self._detach_if(sandbox_id, lambda meta, live: live == run_id)
+        self._teardown(container, stream)
+        return detached
+
     def deliver_answer(self, sandbox_id: str, run_id: str, answers: list[str]) -> bool:
         with self._lock:
             stream = self._streams.get(sandbox_id)
@@ -777,11 +1034,13 @@ class DockerRunner(Runner):
         now = time.time()
         destroyed: list[str] = []
         with self._lock:
-            for sandbox_id, meta in list(self._sandboxes.items()):
-                if now - float(meta.get("last_used", 0.0)) > ttl_seconds:
-                    destroyed.append(sandbox_id)
-        for sandbox_id in destroyed:
-            self.destroy(sandbox_id)
+            candidates = list(self._sandboxes)
+        for sandbox_id in candidates:
+            detached, container, stream = self._detach_if_idle(sandbox_id, ttl_seconds, now)
+            if not detached:
+                continue  # live run, or freshly claimed (see ServerRunner)
+            destroyed.append(sandbox_id)
+            self._teardown(container, stream)
         return destroyed
 
     # -- process I/O ------------------------------------------------------
@@ -879,9 +1138,19 @@ class DockerRunner(Runner):
                 )
             lock = threading.Lock()
             with self._lock:
-                self._containers[sandbox_id] = container
-                self._streams[sandbox_id] = stream
-                self._locks[sandbox_id] = lock
+                vanished = sandbox_id not in self._sandboxes
+                if not vanished:
+                    self._containers[sandbox_id] = container
+                    self._streams[sandbox_id] = stream
+                    self._locks[sandbox_id] = lock
+            if vanished:
+                # Destroyed while we were starting the container and
+                # waiting for `ready`; re-registering would leave state
+                # with no meta (see ServerRunner).  Tear it back down
+                # and report the sandbox as gone.
+                self._teardown(container, stream)
+                self._teardown(*self._detach(sandbox_id))
+                raise SandboxNotFoundError(sandbox_id)
             # respawned container passed its ready handshake; mark it so a
             # later exec on this live container does not re-read ready (its
             # single ready line is consumed) and block until the watchdog
@@ -898,8 +1167,7 @@ class DockerRunner(Runner):
             return ExecResult(exit_code=None, stdout="", stderr="sandbox stream unavailable")
         self.touch(sandbox_id)
         err_from = len(meta["stderr_log"])
-        with self._lock:
-            self._live_run[sandbox_id] = run_id
+        self._claim_live_run(sandbox_id, run_id)
         try:
             if not self._send(stream, lock, {"op": "submit", "prompt": prompt, "run_id": run_id}):
                 return ExecResult(
@@ -920,8 +1188,7 @@ class DockerRunner(Runner):
                     or "harness container died mid-run",
                 )
         finally:
-            with self._lock:
-                self._live_run[sandbox_id] = None
+            self._release_live_run(sandbox_id)
         return ExecResult(
             exit_code=0 if not timed_out else None,
             stdout="".join(stdout_lines),

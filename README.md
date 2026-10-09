@@ -219,7 +219,23 @@ The runner is selected by `PAW_RUNNER`:
   - **locked down** — read-only rootfs, dropped Linux capabilities,
     non-root user, `no-new-privileges`, and memory/CPU/PID ceilings.
 
-Idle sandboxes are reaped after `PAW_SANDBOX__TTL_SECONDS`.
+Idle sandboxes are reaped after `PAW_SANDBOX__TTL_SECONDS` by a
+background sweep (`PAW_SANDBOX__REAP_INTERVAL_SECONDS`). The sweep
+skips any sandbox with a live run, so the TTL bounds idleness and never
+shortens a run — `last_used` is only touched when a run starts, so a
+long run looks increasingly idle while it is working. The idle/stale
+decision is made inside the same lock that removes the sandbox, so a
+run claiming a stale sandbox cannot lose it to a concurrent sweep.
+
+**Sandboxes are per-instance.** A sandbox is a process (or container)
+held by one web instance, so its registry row carries an
+`owner_instance` like runs do. A restart retires its own rows at
+startup; a row whose runner no longer holds it is retired lazily on the
+next run. If a conversation is routed to a *different* instance, that
+instance cannot reach the resident process holding the history, so it
+rebuilds — the agent's context restarts. That is logged and counted
+(`paw_sandbox_instance_migrations_total`), and the fix is session
+affinity: route a conversation to the same instance.
 
 **Secret injection.** User secrets are Fernet-encrypted at rest and
 never returned by the API. For the `docker` runner they are decrypted
@@ -339,9 +355,18 @@ groups use a double underscore (e.g. `PAW_HARNESS__CMD`).
 | `PAW_HARNESS__CMD` | `python-agent-harness` | harness binary |
 | `PAW_HARNESS__CWD` | `""` | override the agent workspace dir per sandbox |
 | `PAW_HARNESS__TIMEOUT` | unset | host-side wall-clock budget for one run |
+| `PAW_HARNESS__MAX_ROUNDS` | unset | cap each run at N LLM rounds (`serve --max-rounds`); unset = unlimited |
+| `PAW_HARNESS__SANDBOX_TIMEOUT` | unset | per-run wall-clock budget enforced *inside* the sandbox (`serve --timeout`); unset = unlimited |
+| `PAW_HARNESS__ANSWER_TIMEOUT` | unset | how long the sandbox waits for an answer to a mid-run question; unset = wait forever |
 | `PAW_WORKSPACE_ROOT` | `./workspaces` | base dir for per-conversation workspaces |
 | `PAW_RUNNER` | `server` | `server` (host subprocess) or `docker` (isolated container) |
-| `PAW_SANDBOX__TTL_SECONDS` | `300` | idle sandbox reaper TTL |
+| `PAW_SANDBOX__TTL_SECONDS` | `300` | idle sandbox reaper TTL (never applied to a sandbox with a live run) |
+| `PAW_SANDBOX__REAP_INTERVAL_SECONDS` | `60` | how often the background reaper sweeps; `0` disables it |
+
+The three budget vars are spawn-time arguments to `harness serve`, not
+fields on the submit op: the harness refuses to take a budget off the
+wire so a run cannot raise its own ceiling. Each is omitted from the
+command line entirely when unset, so the default is an unbounded run.
 
 ### Docker runner
 
@@ -383,7 +408,15 @@ groups use a double underscore (e.g. `PAW_HARNESS__CMD`).
 | var | default | note |
 |---|---|---|
 | `PAW_SHUTDOWN_DRAIN_SECONDS` | `25` | on SIGTERM, seconds to let in-flight runs finish before exit |
+| `PAW_CANCEL_GRACE_SECONDS` | `10` | after a *user* cancels, how long to wait for the harness to honour it before destroying the sandbox; `0` disables escalation |
 | `PAW_INSTANCE_ID` | host+pid | this instance's id (set to pod/task name); scopes run reconciliation |
+
+`PAW_CANCEL_GRACE_SECONDS` is a recovery path, not a run budget: it is
+armed only by an explicit cancel request, never by a timer. The
+protocol `cancel` is cooperative, so a run wedged in an uninterruptible
+operation never reaches the check — and while its row stays `running`
+the partial unique index locks that conversation out of new runs.
+Escalation closes the sandbox so the run's own worker can finalize it.
 
 ---
 

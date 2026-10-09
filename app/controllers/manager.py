@@ -11,6 +11,7 @@ misses anything.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import threading
@@ -40,6 +41,13 @@ class ActiveRun:
     subscribers: set[queue.Queue[dict[str, Any]]] = field(default_factory=set)
     seen: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    escalation_armed: bool = False
+    """Whether a cancel-escalation watchdog is already running for this
+    run.  The cancel endpoint is NOT rate-limited (unlike run
+    submission), so without this latch every repeated cancel on the
+    same live run would spawn another watchdog thread that polls for
+    the whole grace window — cheap to trigger from a client, and a
+    thread-amplification vector."""
 
 
 class Controller:
@@ -119,7 +127,6 @@ class Controller:
         if self._draining.is_set():
             raise RuntimeError("server is shutting down; run rejected")
 
-        sandbox = self._ensure_sandbox(db, user_id=user_id, conversation_id=conversation_id)
         run = Run(
             id=new_id("run"),
             conversation_id=conversation_id,
@@ -129,10 +136,14 @@ class Controller:
             owner_instance=self._instance_id,
         )
         db.add(run)
-        # Commit now: the worker thread finalizes the row from its own
-        # session, so the "running" state must be durable before the
-        # harness process is spawned.  A concurrent submit that won the
-        # race trips the unique index here -> reject this one.
+        # Commit the run row BEFORE building the sandbox.  Two reasons:
+        # the worker finalizes this row from its own session, so
+        # "running" must be durable first; and this commit is what
+        # actually claims the conversation (the partial unique index is
+        # the authoritative guard), so a submit that LOSES the race is
+        # rejected here having spawned nothing.  Creating the sandbox
+        # first meant the loser had already started a harness process
+        # that the rollback then abandoned -- an orphan with no row.
         try:
             db.commit()
         except IntegrityError as exc:
@@ -140,7 +151,31 @@ class Controller:
             raise RuntimeError("conversation already has a running run") from exc
         run_id = run.id
 
-        active = ActiveRun(run_id=run_id, sandbox_id=sandbox.id)
+        # The conversation is ours; now get a sandbox to run in.
+        spawned: list[str] = []
+        try:
+            sandbox = self._ensure_sandbox(
+                db, user_id=user_id, conversation_id=conversation_id, spawned=spawned
+            )
+            sandbox_id = sandbox.id
+            db.commit()
+        except Exception as exc:
+            # The run row is already live, so it must not be left
+            # behind: finalize it before surfacing the failure, or the
+            # conversation stays locked by a run that never started.
+            db.rollback()
+            # A sandbox created just now is only known to the runner;
+            # the rollback threw away its row, so without this it would
+            # be a process nothing owns (the same orphan the commit
+            # ordering above exists to prevent, on the failure path).
+            for orphan in spawned:
+                with contextlib.suppress(Exception):
+                    self._runner.destroy(orphan)
+            _log.warning("run %s: sandbox unavailable: %s", run_id, exc)
+            self._finish_run(run_id, RunOutcome(errors=[f"sandbox unavailable: {exc}"]))
+            raise
+
+        active = ActiveRun(run_id=run_id, sandbox_id=sandbox_id)
         with self._lock:
             self._active[run_id] = active
 
@@ -149,7 +184,7 @@ class Controller:
             _log.info("run %s started (conversation %s)", run_id, conversation_id)
             try:
                 result = self._runner.exec_run(
-                    sandbox.id,
+                    sandbox_id,
                     harness_prompt or prompt,
                     run_id,
                     on_line=lambda line: self._on_line(run_id, line),
@@ -159,6 +194,10 @@ class Controller:
                 )
             except SandboxNotFoundError as exc:
                 _log.warning("run %s: sandbox gone: %s", run_id, exc)
+                # Retire the row too, or _ensure_sandbox hands the same
+                # dead sandbox to the next run and the conversation is
+                # broken for good rather than for one turn.
+                self._mark_sandbox_destroyed(sandbox_id)
                 self._finish_run(run_id, RunOutcome(errors=[f"sandbox gone: {exc}"], duration_ms=0))
                 return
             except Exception as exc:  # worker must always finish the run row
@@ -195,7 +234,12 @@ class Controller:
         """Best-effort graceful cancel: send the protocol cancel op to
         the resident harness process and mark the intent on the run
         row.  The run's own exit (result line with ``cancelled: true``,
-        or error) finalizes the row."""
+        or error) finalizes the row.
+
+        A grace watchdog is armed behind the op (see
+        ``_arm_cancel_escalation``) because ``op:cancel`` is
+        cooperative and a wedged run can ignore it.
+        """
         with self._lock:
             active = self._active.get(run_id)
         if active is None:
@@ -207,7 +251,83 @@ class Controller:
             if run is not None and run.status == "running":
                 run.cancelled = True
                 db.commit()
+        self._arm_cancel_escalation(run_id, active.sandbox_id)
         return True
+
+    def _arm_cancel_escalation(self, run_id: str, sandbox_id: str) -> None:
+        """Destroy the sandbox if a cancelled run refuses to end.
+
+        ``op:cancel`` is a cooperative message: the harness checks it
+        between rounds and unwinds the agent loop, which is why it is
+        preferred (tools salvage, history is retained for the next
+        turn).  A run blocked in an uninterruptible operation never
+        reaches that check, so the cancel is simply ignored — and
+        because the run row stays ``running``, the partial unique index
+        locks the conversation out of starting another run until the
+        process restarts.  That is the unrecoverable case this closes.
+
+        Escalation destroys the sandbox, which closes the process's
+        stdout; the exec's pump sees EOF and the run's own worker
+        finalizes the row through its normal death path, so the
+        terminal state is still written in exactly one place.
+
+        This is NOT a run budget.  It is armed only by an explicit user
+        cancel and never by a timer, so a run nobody cancels is
+        unbounded as before.  ``cancel_grace_seconds`` of 0 disables it.
+        """
+        grace = get_settings().cancel_grace_seconds
+        if grace <= 0:
+            return
+        with self._lock:
+            active = self._active.get(run_id)
+            if active is None or active.escalation_armed:
+                return  # already finished, or a watchdog is already waiting
+            active.escalation_armed = True
+
+        def _escalate() -> None:
+            deadline = time.time() + grace
+            while time.time() < deadline:
+                with self._lock:
+                    if run_id not in self._active:
+                        return  # honoured the cancel and unwound
+                time.sleep(0.1)
+            with self._lock:
+                if run_id not in self._active:
+                    return
+            # Guarded on the run still OWNING the sandbox, not merely on
+            # the run still being active: between the check above and
+            # the teardown below this run could finalize and the next
+            # turn could claim the same (resident) sandbox, and
+            # destroying it then would kill an innocent successor run.
+            # The runner re-checks its own live-run slot atomically.
+            try:
+                released = self._runner.destroy_if_running(sandbox_id, run_id)
+            except Exception:  # noqa: BLE001 - teardown is best-effort
+                # A half-torn-down sandbox is not reusable, so retire
+                # the row anyway and let the next turn build a fresh one.
+                _log.warning(
+                    "run %s: escalation teardown of sandbox %s failed",
+                    run_id,
+                    sandbox_id,
+                    exc_info=True,
+                )
+                released = True
+            if not released:
+                _log.info(
+                    "run %s released the sandbox before escalation fired; left %s alone",
+                    run_id,
+                    sandbox_id,
+                )
+                return
+            _log.warning(
+                "run %s ignored cancel after %.1fs; destroyed sandbox %s to release it",
+                run_id,
+                grace,
+                sandbox_id,
+            )
+            self._mark_sandbox_destroyed(sandbox_id)
+
+        threading.Thread(target=_escalate, name=f"cancel-escalate-{run_id}", daemon=True).start()
 
     def deliver_answer(self, run_id: str, answers: list[str]) -> bool:
         """Forward a user's answer to a pending mid-run question.
@@ -227,7 +347,22 @@ class Controller:
 
     # -- internals ---------------------------------------------------------
 
-    def _ensure_sandbox(self, db: Session, *, user_id: str, conversation_id: str) -> Sandbox:
+    def _ensure_sandbox(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        conversation_id: str,
+        spawned: list[str] | None = None,
+    ) -> Sandbox:
+        """The conversation's live sandbox, creating one if needed.
+
+        Appends the id of any sandbox it CREATES to *spawned*, so a
+        caller whose transaction later fails can tear down a process
+        that its rollback just orphaned.
+        """
+        from ..infra.metrics import get_registry
+
         sandbox = (
             db.query(Sandbox)
             .filter(
@@ -237,18 +372,84 @@ class Controller:
             )
             .one_or_none()
         )
+        if sandbox is not None and not self._runner.exists(sandbox.id):
+            # The row outlived the runner that backed it: sandboxes are
+            # in-process state, so every ``running`` row this runner
+            # does not hold is a corpse.  Reusing it made exec_run raise
+            # SandboxNotFoundError and the run fail with "sandbox
+            # gone" — and since nothing ever cleaned the row up, EVERY
+            # later run on that conversation failed the same way, which
+            # is a permanent break rather than a transient one.  Retire
+            # it and fall through to a fresh sandbox.
+            if sandbox.owner_instance and sandbox.owner_instance != self._instance_id:
+                # Another instance created it, so its resident process
+                # (and the conversation history inside it) is on that
+                # host and unreachable from here.  We can only start
+                # over, which silently costs the user their multi-turn
+                # context — so make it loud: resident sandboxes need
+                # sticky routing to stay on one instance.
+                _log.warning(
+                    "conversation %s moved from instance %s to %s; its resident "
+                    "sandbox is unreachable and agent context restarts — enable "
+                    "session affinity for conversation routing",
+                    conversation_id,
+                    sandbox.owner_instance,
+                    self._instance_id,
+                )
+                get_registry().counter(
+                    "paw_sandbox_instance_migrations_total",
+                    help="Conversations whose sandbox was rebuilt on another instance.",
+                )
+            else:
+                _log.info(
+                    "sandbox %s has no live runner state; retiring the row (conversation %s)",
+                    sandbox.id,
+                    conversation_id,
+                )
+            sandbox.status = "destroyed"
+            sandbox.owner_instance = None
+            db.flush()
+            sandbox = None
+        if sandbox is not None:
+            # Claim it: the reaper judges a sandbox by idle age, and a
+            # sandbox whose conversation the user is returning to is
+            # stale by exactly that measure.  The exec happens later on
+            # a worker thread, so without touching here the reaper may
+            # destroy it in between and the run fails with "sandbox
+            # gone" on the very request that revived the conversation.
+            self._runner.touch(sandbox.id)
         if sandbox is None:
             sandbox_id = self._runner.create(user_id, conversation_id)
+            if spawned is not None:
+                spawned.append(sandbox_id)
             sandbox = Sandbox(
                 id=sandbox_id,
                 runner_id=get_settings().runner,
                 user_id=user_id,
                 conversation_id=conversation_id,
                 status="running",
+                owner_instance=self._instance_id,
             )
             db.add(sandbox)
             db.flush()
         return sandbox
+
+    def _mark_sandbox_destroyed(self, sandbox_id: str) -> None:
+        """Flip a sandbox row to ``destroyed``, in its own session.
+
+        Called from worker/watchdog threads that have no request
+        session.  Best-effort: failing to retire the row must not turn
+        into a second failure on a path that is already handling one.
+        """
+        try:
+            with get_session_factory()() as db:
+                db.query(Sandbox).filter(Sandbox.id == sandbox_id).update(
+                    {Sandbox.status: "destroyed", Sandbox.owner_instance: None},
+                    synchronize_session=False,
+                )
+                db.commit()
+        except Exception:  # noqa: BLE001 - bookkeeping must not mask the real error
+            _log.warning("could not retire sandbox row %s", sandbox_id, exc_info=True)
 
     def _on_line(self, run_id: str, line: str) -> None:
         event = parse_line(line)
@@ -393,6 +594,46 @@ class Controller:
             )
         return n
 
+    def reconcile_orphaned_sandboxes(self) -> int:
+        """Retire sandbox rows left ``running`` by a previous life of THIS
+        instance.
+
+        Sandboxes are in-process state, so at startup this instance's
+        runner registry is empty and every ``running`` row it owns is a
+        corpse.  Leaving them meant ``_ensure_sandbox`` handed a dead
+        sandbox to the conversation's next run; they are retired lazily
+        there too, but doing it once up front keeps the table honest
+        and spares the first request the work.
+
+        Instance-scoped like ``reconcile_orphaned_runs``: another live
+        instance's sandboxes are healthy and must not be touched.
+        Legacy rows with a NULL owner (pre-migration) are retired too,
+        since no live instance claims them.  Returns the count.
+        """
+        with get_session_factory()() as db:
+            n = (
+                db.query(Sandbox)
+                .filter(
+                    Sandbox.status == "running",
+                    or_(
+                        Sandbox.owner_instance == self._instance_id,
+                        Sandbox.owner_instance.is_(None),
+                    ),
+                )
+                .update(
+                    {Sandbox.status: "destroyed", Sandbox.owner_instance: None},
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+        if n:
+            _log.info(
+                "retired %d orphaned sandbox row(s) on startup (instance %s)",
+                n,
+                self._instance_id,
+            )
+        return n
+
     def drain(self, timeout: float = 25.0) -> int:
         """Stop accepting new runs and wait for in-flight ones to finish.
 
@@ -431,7 +672,8 @@ class Controller:
             db = factory()
             try:
                 db.query(Sandbox).filter(Sandbox.id.in_(destroyed)).update(
-                    {Sandbox.status: "destroyed"}, synchronize_session=False
+                    {Sandbox.status: "destroyed", Sandbox.owner_instance: None},
+                    synchronize_session=False,
                 )
                 db.commit()
             finally:

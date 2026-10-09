@@ -28,11 +28,13 @@ def upgrade() -> None:
     sa.Column('conversation_id', sa.String(length=40), nullable=False),
     sa.Column('spec', sa.JSON(), nullable=False),
     sa.Column('status', sa.String(length=16), nullable=False),
+    sa.Column('owner_instance', sa.String(length=64), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('last_used_at', sa.DateTime(timezone=True), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     with op.batch_alter_table('sandboxes', schema=None) as batch_op:
+        batch_op.create_index(batch_op.f('ix_sandboxes_owner_instance'), ['owner_instance'], unique=False)
         batch_op.create_index(batch_op.f('ix_sandboxes_status'), ['status'], unique=False)
         batch_op.create_index(batch_op.f('ix_sandboxes_user_id'), ['user_id'], unique=False)
 
@@ -175,6 +177,7 @@ def downgrade() -> None:
     with op.batch_alter_table('sandboxes', schema=None) as batch_op:
         batch_op.drop_index(batch_op.f('ix_sandboxes_user_id'))
         batch_op.drop_index(batch_op.f('ix_sandboxes_status'))
+        batch_op.drop_index(batch_op.f('ix_sandboxes_owner_instance'))
 
     op.drop_table('sandboxes')
     # ### end Alembic commands ###
