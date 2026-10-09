@@ -122,6 +122,7 @@ def upgrade() -> None:
     sa.Column('answer', sa.Text(), nullable=False),
     sa.Column('events', sa.JSON(), nullable=False),
     sa.Column('error', sa.Text(), nullable=False),
+    sa.Column('error_code', sa.String(length=32), nullable=False),
     sa.Column('harness_run_id', sa.String(length=64), nullable=False),
     sa.Column('owner_instance', sa.String(length=64), nullable=True),
     sa.Column('exit_code', sa.Integer(), nullable=True),

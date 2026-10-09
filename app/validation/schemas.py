@@ -116,6 +116,14 @@ class RunAnswer(BaseModel):
     """A user's reply to a pending mid-run question (resident mode)."""
 
     answers: list[str] = Field(min_length=1)
+    ask_id: str | None = Field(default=None, max_length=64)
+    """Which question is being answered (from the ``ask`` event).
+
+    Optional for older clients: the server falls back to the last ask
+    it saw.  Sending it is better, because it is the question the user
+    actually saw — the harness can then refuse a reply aimed at a
+    question that has since been abandoned, instead of applying it to
+    whatever is pending now."""
 
 
 class RunEvent(BaseModel):
@@ -133,6 +141,7 @@ class RunOut(BaseModel):
     prompt: str
     answer: str
     error: str
+    error_code: str = ""
     cancelled: bool
     exit_code: int | None
     duration_ms: int

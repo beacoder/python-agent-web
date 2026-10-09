@@ -569,8 +569,8 @@ class TestAnswerRun:
             def cancel(self, sandbox_id, run_id):
                 return True
 
-            def deliver_answer(self, sandbox_id, run_id, answers):
-                self.answers.append((run_id, answers))
+            def deliver_answer(self, sandbox_id, run_id, answers, ask_id=None):
+                self.answers.append((run_id, answers, ask_id))
                 return True
 
             def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
@@ -600,7 +600,7 @@ class TestAnswerRun:
             )
             assert res.status_code == 200
             assert res.json() == {"delivered": True}
-            assert runner.answers == [(run_id, ["blue", "red"])]
+            assert runner.answers == [(run_id, ["blue", "red"], None)]
             # let the worker finish before the fixture resets the DB
             # engine for the next test — a late finalize would query the
             # fresh engine (flaky "no such table: runs" in its thread)
@@ -670,3 +670,86 @@ class TestRunTimeoutForwarding:
             assert poll.json()["status"] == "done"
         finally:
             mgr._controller = real
+
+
+@pytest.mark.usefixtures("_scripted_runner")
+class TestStreamResume:
+    """SSE ids let a reconnecting client resume instead of replaying.
+
+    ``seq`` was already on every line; without an ``id:`` frame field
+    the standard ``Last-Event-ID`` mechanism could not be used at all,
+    so every reconnect replayed the run from the beginning.
+    """
+
+    def _finished_run(self, client: TestClient) -> tuple[dict, str, str]:
+        headers, conversation_id = _setup(client)
+        run_id = client.post(
+            f"/conversations/{conversation_id}/runs", json={"prompt": "x"}, headers=headers
+        ).json()["id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            poll = client.get(f"/conversations/{conversation_id}/runs/{run_id}", headers=headers)
+            if poll.json()["status"] != "running":
+                break
+            time.sleep(0.02)
+        return headers, conversation_id, run_id
+
+    def _stream(self, client, headers, cid, rid, resume: str | None = None):
+        hdrs = dict(headers)
+        if resume is not None:
+            hdrs["Last-Event-ID"] = resume
+        return client.get(f"/conversations/{cid}/runs/{rid}/stream", headers=hdrs)
+
+    def test_frames_carry_the_seq_as_an_event_id(self, client: TestClient) -> None:
+        headers, cid, rid = self._finished_run(client)
+        res = self._stream(client, headers, cid, rid)
+        assert res.status_code == 200
+        ids = [
+            int(line.split(":", 1)[1].strip())
+            for line in res.text.splitlines()
+            if line.startswith("id:")
+        ]
+        assert ids == sorted(ids) and ids  # monotonic ids present
+        assert '"state": "done"' in res.text
+
+    def test_last_event_id_header_skips_what_was_seen(self, client: TestClient) -> None:
+        headers, cid, rid = self._finished_run(client)
+        full = self._stream(client, headers, cid, rid).text
+        seqs = [
+            int(line.split(":", 1)[1].strip())
+            for line in full.splitlines()
+            if line.startswith("id:")
+        ]
+        resumed = self._stream(client, headers, cid, rid, resume=str(seqs[0]))
+        assert resumed.status_code == 200
+        remaining = [
+            int(line.split(":", 1)[1].strip())
+            for line in resumed.text.splitlines()
+            if line.startswith("id:")
+        ]
+        assert all(s > seqs[0] for s in remaining)
+        assert len(remaining) < len(seqs)
+
+    def test_the_terminal_event_survives_any_resume_point(self, client: TestClient) -> None:
+        """It carries no seq, so it must never be skipped -- otherwise a
+        resumed client waits forever on a run that is already over."""
+        headers, cid, rid = self._finished_run(client)
+        resumed = self._stream(client, headers, cid, rid, resume="99999")
+        assert '"state": "done"' in resumed.text
+
+    def test_a_query_param_resume_point_also_works(self, client: TestClient) -> None:
+        """The UI streams with a token in the query string and so cannot
+        set request headers."""
+        headers, cid, rid = self._finished_run(client)
+        res = client.get(
+            f"/conversations/{cid}/runs/{rid}/stream?last_event_id=99999", headers=headers
+        )
+        assert res.status_code == 200
+        assert '"state": "done"' in res.text
+        assert "id:" not in res.text  # everything numbered was skipped
+
+    def test_a_garbage_resume_point_is_ignored(self, client: TestClient) -> None:
+        headers, cid, rid = self._finished_run(client)
+        res = self._stream(client, headers, cid, rid, resume="not-a-number")
+        assert res.status_code == 200
+        assert "hello" in res.text  # full replay, not an error

@@ -27,8 +27,22 @@ from sqlalchemy.orm import Session
 from ..infra.config import get_settings
 from ..infra.db import get_session_factory
 from ..infra.logging import get_logger
-from ..models import Conversation, Run, Sandbox, UsageEvent, new_id
-from .protocol import RunOutcome, apply_event, parse_line
+from ..infra.metrics import get_registry
+from ..models import Conversation, Run, Sandbox, UsageEvent, User, new_id
+from . import usage as usage_controller
+from .protocol import (
+    CONTROL_LINE_TYPES,
+    KNOWN_NOTIFY_KINDS,
+    ProtocolEvent,
+    RunOutcome,
+    SeqTracker,
+    apply_event,
+    coalesce_events,
+    live_usage_total,
+    notify_kind,
+    parse_line,
+    sanitize_event,
+)
 from .runner import Runner, SandboxNotFoundError, get_runner
 
 _log = get_logger("run")
@@ -38,9 +52,14 @@ _log = get_logger("run")
 class ActiveRun:
     run_id: str
     sandbox_id: str
+    user_id: str = ""
     subscribers: set[queue.Queue[dict[str, Any]]] = field(default_factory=set)
     seen: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    seq: SeqTracker = field(default_factory=SeqTracker)
+    """Monotonic ``seq`` checker for this run's lines (drop detection)."""
+    warned_slow_subscriber: bool = False
+    """Latch so a slow client is reported once, not once per event."""
     escalation_armed: bool = False
     """Whether a cancel-escalation watchdog is already running for this
     run.  The cancel endpoint is NOT rate-limited (unlike run
@@ -48,6 +67,22 @@ class ActiveRun:
     same live run would spawn another watchdog thread that polls for
     the whole grace window — cheap to trigger from a client, and a
     thread-amplification vector."""
+    pending_ask_id: str | None = None
+    """``ask_id`` of the question currently awaiting an answer.
+
+    Recorded from the ``ask`` notify so an answer can name the question
+    it belongs to.  Without correlation the harness resolves whatever
+    is pending, so a reply sent for a question that has since timed out
+    would answer the NEXT one instead."""
+    token_allowance: int | None = None
+    """Tokens this run may still consume, snapshotted at start.
+
+    None when budget enforcement is off.  Taken once rather than
+    queried per round: the ledger only moves when a run finishes, so
+    re-reading it mid-run would return the same number."""
+    budget_exceeded: bool = False
+    """Set when mid-run metering cancelled this run for overspend, so
+    the terminal row can say so rather than reporting a bare cancel."""
 
 
 class Controller:
@@ -74,16 +109,25 @@ class Controller:
 
     # -- subscriptions ----------------------------------------------------
 
-    def subscribe(self, run_id: str) -> queue.Queue[dict[str, Any]] | None:
-        """Attach to a run; replay already-seen events into the queue."""
+    def subscribe(self, run_id: str, since_seq: int = 0) -> queue.Queue[dict[str, Any]] | None:
+        """Attach to a run; replay already-seen events into the queue.
+
+        ``since_seq`` skips events a reconnecting client already has
+        (its SSE ``Last-Event-ID``).  Events without a ``seq`` are
+        always replayed: those are lifecycle events, and dropping the
+        terminal one would leave the client waiting on a finished run.
+        """
         with self._lock:
             active = self._active.get(run_id)
         if active is None:
             return None
-        q: queue.Queue[dict[str, Any]] = queue.Queue()
+        bound = get_settings().max_subscriber_queue
+        q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=max(0, bound))
         with active.lock:
             for event in active.seen:
-                q.put(event)
+                if _already_seen(event, since_seq):
+                    continue
+                _offer(q, event)
             active.subscribers.add(q)
         return q
 
@@ -175,7 +219,12 @@ class Controller:
             self._finish_run(run_id, RunOutcome(errors=[f"sandbox unavailable: {exc}"]))
             raise
 
-        active = ActiveRun(run_id=run_id, sandbox_id=sandbox_id)
+        active = ActiveRun(
+            run_id=run_id,
+            sandbox_id=sandbox_id,
+            user_id=user_id,
+            token_allowance=self._token_allowance(user_id),
+        )
         with self._lock:
             self._active[run_id] = active
 
@@ -236,7 +285,8 @@ class Controller:
         row.  The run's own exit (result line with ``cancelled: true``,
         or error) finalizes the row.
 
-        A grace watchdog is armed behind the op (see
+        False when the run is not cancellable -- unknown, or already
+        finished.  A grace watchdog is armed behind the op (see
         ``_arm_cancel_escalation``) because ``op:cancel`` is
         cooperative and a wedged run can ignore it.
         """
@@ -244,13 +294,22 @@ class Controller:
             active = self._active.get(run_id)
         if active is None:
             return False
-        self._broadcast(run_id, {"type": "run", "state": "cancel_requested"})
-        self._runner.cancel(active.sandbox_id, run_id)
+        # The persisted status, not _active membership, decides whether
+        # a run can still be cancelled.  A finished run stays briefly
+        # in _active: _finish_run commits the terminal row and only
+        # then closes the active entry, syncing artifacts in between
+        # (filesystem/S3 work, so the gap is not small).  Keying off
+        # _active alone made a cancel issued after the run had visibly
+        # finished report success, flip ``cancelled`` on a completed
+        # run, and arm an escalation watchdog for nothing.
         with get_session_factory()() as db:
             run = db.get(Run, run_id)
-            if run is not None and run.status == "running":
-                run.cancelled = True
-                db.commit()
+            if run is None or run.status != "running":
+                return False
+            run.cancelled = True
+            db.commit()
+        self._broadcast(run_id, {"type": "run", "state": "cancel_requested"})
+        self._runner.cancel(active.sandbox_id, run_id)
         self._arm_cancel_escalation(run_id, active.sandbox_id)
         return True
 
@@ -329,21 +388,27 @@ class Controller:
 
         threading.Thread(target=_escalate, name=f"cancel-escalate-{run_id}", daemon=True).start()
 
-    def deliver_answer(self, run_id: str, answers: list[str]) -> bool:
+    def deliver_answer(self, run_id: str, answers: list[str], ask_id: str | None = None) -> bool:
         """Forward a user's answer to a pending mid-run question.
 
         Returns False when the run is not live (unknown/finished); the
         route maps that to 409.  The runner forwards the answer as an
         ``op:answer`` protocol message to the resident harness process.
+
+        ``ask_id`` names the question being answered.  A caller-supplied
+        id wins (it is the question the user actually saw); otherwise
+        the id recorded from the last ``ask`` notify is used.  Either
+        way the harness can refuse a reply aimed at a question that is
+        no longer pending, instead of applying it to whatever is.
         """
         with self._lock:
             active = self._active.get(run_id)
         if active is None:
             return False
-        delivered = getattr(self._runner, "deliver_answer", None)
-        if delivered is None:
-            return False
-        return bool(delivered(active.sandbox_id, run_id, answers))
+        if not ask_id:
+            with active.lock:
+                ask_id = active.pending_ask_id
+        return bool(self._runner.deliver_answer(active.sandbox_id, run_id, answers, ask_id))
 
     # -- internals ---------------------------------------------------------
 
@@ -361,8 +426,6 @@ class Controller:
         caller whose transaction later fails can tear down a process
         that its rollback just orphaned.
         """
-        from ..infra.metrics import get_registry
-
         sandbox = (
             db.query(Sandbox)
             .filter(
@@ -455,12 +518,148 @@ class Controller:
         event = parse_line(line)
         if event is None:
             return
+        if not self._accept_line(run_id, event):
+            return
         payload = {"type": event.type, "data": event.data, "malformed": event.malformed}
         if event.seq is not None:
             payload["seq"] = event.seq
         if event.run_id is not None:
             payload["run_id"] = event.run_id
+        kind = notify_kind(event)
+        if kind is not None:
+            if kind == "ask":
+                self._remember_ask(run_id, event.data.get("data"))
+            elif kind == "usage":
+                self._meter_live_usage(run_id, event.data.get("data"))
+            if kind not in KNOWN_NOTIFY_KINDS:
+                # Relayed anyway (the harness may add kinds and the UI
+                # degrades to showing it raw), but flagged so a client
+                # can choose not to render something it cannot model.
+                payload["unknown_kind"] = True
+        payload = sanitize_event(payload, get_settings().max_event_bytes)
         self._broadcast(run_id, payload)
+
+    def _accept_line(self, run_id: str, event: ProtocolEvent) -> bool:
+        """Validate a line's correlation and ordering; False to drop it.
+
+        Two guards the protocol provides and this host used to ignore:
+
+        ``run_id`` -- the harness goes to some lengths to keep one
+        run's stragglers out of the next run's stream, but a host that
+        never checks is trusting rather than verifying.  A line
+        labelled with a different run is quarantined instead of being
+        fanned out under this one's id.  Control lines (``ready``,
+        ``pong``) carry no run_id and are not run events, so they are
+        consumed here rather than relayed.
+
+        ``seq`` -- documented as the means to detect drops and
+        reordering, which requires somebody to actually compare it.
+        An anomaly is counted and logged once, but the line is still
+        delivered: a gap means an EARLIER line was lost, not that this
+        one is bad.
+        """
+        if event.type in CONTROL_LINE_TYPES:
+            _log.debug("run %s: control line %s consumed", run_id, event.type)
+            return False
+        if event.run_id is not None and event.run_id != run_id:
+            _log.warning(
+                "run %s: dropping line labelled run_id=%s (cross-run contamination)",
+                run_id,
+                event.run_id,
+            )
+            get_registry().counter(
+                "paw_protocol_run_id_mismatch_total",
+                help="Harness lines whose run_id did not match the exec they arrived on.",
+            )
+            return False
+        with self._lock:
+            active = self._active.get(run_id)
+        if active is not None:
+            with active.lock:
+                anomaly = active.seq.check(event.seq)
+            if anomaly is not None:
+                _log.warning("run %s: %s", run_id, anomaly)
+                get_registry().counter(
+                    "paw_protocol_seq_anomalies_total",
+                    help="Harness lines arriving out of order or after a gap.",
+                )
+        return True
+
+    def _remember_ask(self, run_id: str, data: Any) -> None:
+        """Record the pending question's ``ask_id`` for correlation."""
+        if not isinstance(data, dict):
+            return
+        ask_id = data.get("ask_id")
+        if not ask_id:
+            return  # harness predating ask correlation; nothing to echo
+        with self._lock:
+            active = self._active.get(run_id)
+        if active is not None:
+            with active.lock:
+                active.pending_ask_id = str(ask_id)
+
+    def _token_allowance(self, user_id: str) -> int | None:
+        """Tokens this user may still spend, or None when unenforced."""
+        if not get_settings().budget_enforce:
+            return None
+        try:
+            with get_session_factory()() as db:
+                user = db.get(User, user_id)
+                if user is None:
+                    return None
+                return usage_controller.budget_status(db, user).remaining
+        except Exception:  # noqa: BLE001 - metering must not break run start
+            _log.warning("could not read token allowance for %s", user_id, exc_info=True)
+            return None
+
+    def _meter_live_usage(self, run_id: str, data: Any) -> None:
+        """Cancel the run if its own tokens have outrun the allowance.
+
+        The harness reports running ``{input, output, rounds}`` after
+        each round, so a run that blows the budget can be stopped while
+        it is still spending.  Without this, enforcement happened only
+        before a run started: a single run could overshoot the
+        allowance by any amount and the overspend was discovered from
+        the ``result`` line, after the tokens were already bought.
+        """
+        if not isinstance(data, dict):
+            return
+        with self._lock:
+            active = self._active.get(run_id)
+        if active is None:
+            return
+        with active.lock:
+            allowance = active.token_allowance
+            already_over = active.budget_exceeded
+        if allowance is None or already_over:
+            return
+        spent = live_usage_total(data)
+        if spent <= allowance:
+            return
+        with active.lock:
+            if active.budget_exceeded:
+                return  # another round's snapshot already tripped it
+            active.budget_exceeded = True
+        _log.warning(
+            "run %s exceeded its token allowance mid-run (%d > %d); cancelling",
+            run_id,
+            spent,
+            allowance,
+        )
+        get_registry().counter(
+            "paw_runs_budget_cancelled_total",
+            help="Runs cancelled mid-run for exceeding the token allowance.",
+        )
+        self._broadcast(
+            run_id,
+            {
+                "type": "run",
+                "state": "budget_exceeded",
+                "data": {"spent": spent, "allowance": allowance},
+            },
+        )
+        self._runner.cancel(active.sandbox_id, run_id)
+        self._arm_cancel_escalation(run_id, active.sandbox_id)
 
     def _broadcast(self, run_id: str, payload: dict[str, Any]) -> None:
         with self._lock:
@@ -470,8 +669,24 @@ class Controller:
         with active.lock:
             active.seen.append(payload)
             subscribers = list(active.subscribers)
+        dropped = 0
         for q in subscribers:
-            q.put(payload)
+            dropped += 0 if _offer(q, payload) else 1
+        if dropped:
+            with active.lock:
+                first = not active.warned_slow_subscriber
+                active.warned_slow_subscriber = True
+            if first:
+                _log.warning(
+                    "run %s: subscriber queue full; dropping oldest events "
+                    "(a client is reading slower than the run emits)",
+                    run_id,
+                )
+            get_registry().counter(
+                "paw_sse_events_dropped_total",
+                value=dropped,
+                help="Events dropped because a subscriber's queue was full.",
+            )
 
     def _finish_run(self, run_id: str, outcome: RunOutcome) -> None:
         """Persist terminal state, then notify subscribers.
@@ -483,13 +698,24 @@ class Controller:
         """
         final_state = run_status(outcome)
         events = self._events_snapshot(run_id)
-        if outcome.errors:
-            _log.warning("run %s finished: %s — %s", run_id, final_state, "; ".join(outcome.errors))
+        # A run we cancelled for overspend must say so: the harness only
+        # reports "cancelled", which is indistinguishable from a user
+        # pressing stop.
+        with self._lock:
+            active = self._active.get(run_id)
+        if active is not None and active.budget_exceeded:
+            message = "token budget exceeded mid-run; run cancelled"
+            if message not in outcome.errors:
+                outcome.errors.append(message)
+            if "budget" not in outcome.codes:
+                outcome.codes.insert(0, "budget")
+        if outcome.error_trail:
+            _log.warning(
+                "run %s finished: %s — %s", run_id, final_state, "; ".join(outcome.error_trail)
+            )
         else:
             _log.info("run %s finished: %s (%dms)", run_id, final_state, outcome.duration_ms)
         # metrics: runs by terminal state, latency, and tokens spent
-        from ..infra.metrics import get_registry
-
         registry = get_registry()
         registry.counter(
             "paw_runs_total", labels={"state": final_state}, help="Runs by terminal state."
@@ -544,7 +770,9 @@ class Controller:
             active.seen.append(final)
             subscribers = list(active.subscribers)
         for q in subscribers:
-            q.put(final)
+            # The terminal event must land even against a full queue, or
+            # the client waits forever on a run that is over.
+            _offer(q, final, force=True)
 
     # -- reaper ------------------------------------------------------------
 
@@ -681,8 +909,46 @@ class Controller:
         return destroyed
 
 
+def _offer(q: queue.Queue, event: dict[str, Any], force: bool = False) -> bool:
+    """Enqueue *event*, dropping the oldest when the queue is full.
+
+    Unbounded queues meant a single slow SSE reader could grow without
+    limit for as long as a chatty run kept emitting.  Dropping the
+    OLDEST keeps the stream current, which is what a live view wants,
+    and the gap is visible to the client as a jump in the SSE ``id``
+    -- it can reconnect and resume from there.
+
+    ``force`` retries until it fits: used for the terminal event, which
+    a client must receive or it waits forever on a finished run.
+    """
+    while True:
+        try:
+            q.put_nowait(event)
+            return True
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:  # pragma: no cover - drained concurrently
+                continue
+            if not force:
+                return False
+
+
+def _already_seen(event: dict[str, Any], since_seq: int) -> bool:
+    """Whether a reconnecting client at *since_seq* already has *event*.
+
+    Only numbered events can be skipped.  Lifecycle events carry no
+    ``seq`` and must always be delivered -- skipping the terminal one
+    would leave the client waiting forever on a run that is over.
+    """
+    if since_seq <= 0:
+        return False
+    seq = event.get("seq")
+    return isinstance(seq, int) and seq <= since_seq
+
+
 def run_status(outcome: RunOutcome) -> str:
-    return "cancelled" if outcome.cancelled else ("error" if outcome.errors else "done")
+    return "cancelled" if outcome.cancelled else ("error" if outcome.failed else "done")
 
 
 def _write_terminal_run(
@@ -700,7 +966,8 @@ def _write_terminal_run(
     run = _resolve_run_row(db, run_id, final_state)
     run.status = final_state
     run.answer = outcome.answer
-    run.error = "\n".join(outcome.errors)
+    run.error = "\n".join(outcome.error_trail)
+    run.error_code = outcome.primary_code
     run.exit_code = outcome.exit_code
     run.cancelled = outcome.cancelled
     run.finished_at = _now()
@@ -710,7 +977,10 @@ def _write_terminal_run(
     if outcome.duration_ms:
         run.duration_ms = outcome.duration_ms
     if events is not None:
-        run.events = events
+        # Deltas are token-sized and were stored one row per token, so
+        # the transcript grew without bound for a long answer.  Merging
+        # them is lossless for rendering (clients concatenate anyway).
+        run.events = coalesce_events(events, get_settings().max_stored_events)
     if outcome.usage is not None:
         _record_usage(db, run, outcome)
 

@@ -79,6 +79,16 @@ class SandboxSettings(BaseSettings):
     0 disables the background sweep (startup-only, the old no-op
     behaviour)."""
 
+    probe_timeout: float = 5.0
+    """How long to wait for ``pong`` when reusing a warm sandbox.
+
+    A resident process that is alive but no longer reading its stdin is
+    invisible to an exit-status check, and submitting to it hangs for
+    the host timeout -- which is unbounded by default.  One ``ping``
+    round-trip before reusing a warm process converts that hang into a
+    respawn.  Only runs between turns (never while a run owns stdout).
+    0 disables the probe."""
+
 
 class StorageSettings(BaseSettings):
     """Durable blob-store selection for uploads and artifacts.
@@ -209,6 +219,52 @@ class Settings(BaseSettings):
     ``redis`` (shared across instances for a global limit)."""
     rate_limit_redis_url: str = ""
     """Redis URL for the ``redis`` backend; empty = localhost default."""
+
+    max_line_bytes: int = 4 * 1024 * 1024
+    """Longest single JSONL line accepted from a sandbox.
+
+    ``readline`` is unbounded by default, so one pathological line from
+    untrusted agent code is enough to exhaust the trusted process's
+    memory before anything can inspect it.  An oversize line is
+    discarded (to its newline, so the remainder is not reparsed as
+    fresh lines) and counted.  Generous on purpose: legitimate lines
+    are far smaller than this, bounded in turn by
+    ``max_event_bytes``.  0 disables the cap."""
+
+    max_run_stdout_bytes: int = 8 * 1024 * 1024
+    """Cap on the raw transcript an exec keeps in memory.
+
+    The pump accumulated every line of a run, so a chatty agent held
+    the whole stream in RAM on top of the copies in the fan-out buffer
+    and the database.  Past the cap only outcome-bearing lines
+    (``result``, ``error``, error/usage ``notify``) are retained, so
+    the verdict and the billing numbers can never be dropped.
+    0 disables the cap."""
+
+    max_stored_events: int = 2000
+    """Cap on the events persisted with a finished run.
+
+    Consecutive ``delta`` lines are merged first (concatenation is
+    lossless for rendering), which removes most of the volume; this
+    bounds what survives for a pathological run.  Elided events are
+    replaced by one marker so a replay is honest about the gap."""
+
+    max_subscriber_queue: int = 1000
+    """Per-SSE-subscriber queue depth.
+
+    Unbounded queues meant one slow client could grow without limit
+    while a chatty run streamed.  When full, the oldest event is
+    dropped so the stream stays current; the ``id:`` gap is visible to
+    the client, which can reconnect and resume.  0 disables the bound."""
+
+    max_event_bytes: int = 64 * 1024
+    """Per-event cap on relayed harness payloads.
+
+    Everything in a ``notify``/``log`` payload is produced by untrusted
+    agent code and forwarded verbatim into an SSE frame, the stored
+    transcript, and the browser DOM.  Oversize bodies are replaced with
+    a truncation marker rather than relayed; the envelope a client
+    needs to stay parseable is never touched.  0 disables the cap."""
 
     shutdown_drain_seconds: float = 25.0
     """On shutdown, how long to wait for in-flight runs to finish before

@@ -114,6 +114,12 @@ class Run(Base):
     answer: Mapped[str] = mapped_column(Text, default="")
     events: Mapped[list] = mapped_column(JSON, default=list)
     error: Mapped[str] = mapped_column(Text, default="")
+    # Machine-branchable verdict from the harness's structured errors
+    # ("budget", "timeout", "protocol", ...), kept beside the human
+    # text so a caller does not have to match words in a sentence to
+    # decide whether a failure is retryable or billable.  Empty on a
+    # successful run, or when the harness classified nothing.
+    error_code: Mapped[str] = mapped_column(String(32), default="")
     harness_run_id: Mapped[str] = mapped_column(String(64), default="")
     # The web instance that owns this run's in-process worker thread.
     # Set while running so a restart reconciles only its OWN orphaned

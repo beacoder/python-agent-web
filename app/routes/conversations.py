@@ -11,7 +11,7 @@ import asyncio
 import json
 import queue
 
-from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi import APIRouter, Depends, File, Request, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -53,6 +53,7 @@ def _run_out(run: Run) -> RunOut:
         prompt=run.prompt,
         answer=run.answer,
         error=run.error,
+        error_code=run.error_code,
         cancelled=run.cancelled,
         exit_code=run.exit_code,
         duration_ms=run.duration_ms,
@@ -63,7 +64,34 @@ def _run_out(run: Run) -> RunOut:
 
 
 def _sse(payload: dict) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    """One SSE frame, carrying the harness ``seq`` as the event id.
+
+    The id is what makes reconnection cheap: a browser that drops the
+    connection sends the last id back as ``Last-Event-ID`` (natively,
+    for EventSource) and resumes from there instead of replaying the
+    whole run.  Lifecycle events have no ``seq`` and so no id — they
+    are always delivered, since a client must not be able to resume
+    past the terminal event and hang forever.
+    """
+    frame = ""
+    seq = payload.get("seq")
+    if isinstance(seq, int):
+        frame += f"id: {seq}\n"
+    return frame + f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _resume_from(request: Request, explicit: str | None) -> int:
+    """The ``seq`` a reconnecting client has already seen, else 0.
+
+    Prefers the standard ``Last-Event-ID`` header (EventSource sets it
+    automatically); a query parameter is accepted too, because the UI's
+    token-in-query stream cannot set headers.
+    """
+    raw = explicit or request.headers.get("last-event-id") or ""
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
 
 
 @router.post("", response_model=ConversationOut, status_code=status.HTTP_201_CREATED)
@@ -219,7 +247,7 @@ def answer_run(
 ) -> dict:
     conversation = conversations_controller.owned(db, user, conversation_id)
     runs_controller.of_conversation(db, conversation, run_id)
-    runs_controller.answer(controller, run_id, body.answers)
+    runs_controller.answer(controller, run_id, body.answers, body.ask_id)
     return {"delivered": True}
 
 
@@ -227,6 +255,8 @@ def answer_run(
 def stream_run(
     conversation_id: str,
     run_id: str,
+    request: Request,
+    last_event_id: str | None = None,
     user: User = Depends(authenticate_user),
     db: Session = Depends(get_db),
     controller: Controller = Depends(get_controller),
@@ -234,15 +264,19 @@ def stream_run(
     """SSE stream of harness events for one run.
 
     Events are relayed as JSON; a terminal ``{"type": "run", ...}``
-    event (state done/error/cancelled) closes the stream.
+    event (state done/error/cancelled) closes the stream.  Each frame
+    carries the harness ``seq`` as its SSE id, so a reconnecting client
+    can send ``Last-Event-ID`` (or ``?last_event_id=``) and resume
+    instead of replaying the run from the beginning.
     """
     conversation = conversations_controller.owned(db, user, conversation_id)
     run = runs_controller.of_conversation(db, conversation, run_id)
 
-    q = controller.subscribe(run_id)
+    since = _resume_from(request, last_event_id)
+    q = controller.subscribe(run_id, since_seq=since)
     if q is None:
         # run already finished: replay the stored transcript once
-        payloads = runs_controller.replay_payloads(run)
+        payloads = runs_controller.replay_payloads(run, since_seq=since)
         return StreamingResponse("".join(_sse(p) for p in payloads), media_type="text/event-stream")
 
     async def _stream():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from app.controllers.manager import Controller
 from app.controllers.runner import ExecResult, Runner, SandboxNotFoundError
 from app.infra.config import get_settings
 from app.infra.db import get_session_factory
+from app.infra.metrics import get_registry as get_metrics
 from app.models import Conversation, Run, Sandbox, User, new_id
 
 
@@ -294,6 +296,51 @@ class TestSubscriptions:
     def test_cancel_unknown_run(self) -> None:
         controller = _controller(StubRunner())
         assert controller.cancel_run("run_missing") is False
+
+    def test_cancel_refuses_a_run_whose_row_is_already_terminal(self, user_id) -> None:
+        """A finished run must not be cancellable, even while it is
+        briefly still in ``_active``.
+
+        ``_finish_run`` commits the terminal row and only then closes
+        the active entry, syncing artifacts in between -- so there is a
+        real window where the API reports the run as done while the
+        in-memory entry survives.  Keying the answer off ``_active``
+        made a cancel in that window report success, flip ``cancelled``
+        on a completed run, and arm an escalation watchdog for nothing.
+        """
+        uid, cid = user_id
+        runner = WedgedRunner()  # keeps the run in _active indefinitely
+        controller = _controller(runner)
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+            run_id = run.id
+        finally:
+            db.close()
+
+        # simulate the window: terminal row, entry still active
+        db = get_session_factory()()
+        try:
+            db.get(Run, run_id).status = "done"
+            db.commit()
+        finally:
+            db.close()
+        with controller._lock:
+            assert run_id in controller._active
+
+        try:
+            assert controller.cancel_run(run_id) is False
+            assert runner.cancelled == []  # no cancel op sent
+            assert runner.destroyed == []  # no escalation armed
+            db = get_session_factory()()
+            try:
+                row = db.get(Run, run_id)
+                assert row.cancelled == 0 or row.cancelled is False  # intent not flipped
+            finally:
+                db.close()
+        finally:
+            runner.released.set()  # let the worker unwind
+            _wait_status(controller, run_id, {"done", "error"})
 
     def test_cancel_running_run(self, user_id) -> None:
         uid, cid = user_id
@@ -1225,3 +1272,595 @@ class TestSandboxOwnership:
             db.close()
         assert rows["sbx_elsewhere"] == ("destroyed", None)
         assert rows["sbx_0"] == ("running", "inst-a")  # rebuilt here, stamped here
+
+
+RESULT_BUDGET = (
+    '{"type": "start", "seq": 1}\n'
+    '{"type": "result", "seq": 2, "answer": "", '
+    '"errors": [{"code": "budget", "message": "round budget exhausted"}], '
+    '"error_messages": ["round budget exhausted"], "usage": {"input": 9, "output": 1}}\n'
+)
+
+
+class TestErrorCodePersisted:
+    """The machine-branchable verdict must survive into the row."""
+
+    def test_structured_code_lands_on_the_run(self, user_id) -> None:
+        uid, cid = user_id
+        controller = _controller(StubRunner(stdout=RESULT_BUDGET))
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+        finally:
+            db.close()
+        _wait_status(controller, run.id, {"error"})
+        row = _run_row(run.id)
+        assert row.status == "error"
+        assert row.error_code == "budget"  # not buried in prose
+        assert "round budget exhausted" in row.error
+
+    def test_a_clean_run_has_no_code(self, user_id) -> None:
+        uid, cid = user_id
+        controller = _controller(StubRunner(stdout=RESULT_OK))
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+        finally:
+            db.close()
+        _wait_status(controller, run.id, {"done"})
+        assert _run_row(run.id).error_code == ""
+
+
+@dataclass
+class AskingRunner(StubRunner):
+    """Emits an ask carrying an ``ask_id``, then waits to be answered."""
+
+    answers: list = field(default_factory=list)
+    asked: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+    ask_id: str = "ask-7f3"
+
+    def deliver_answer(self, sandbox_id, run_id, answers, ask_id=None):
+        self.answers.append((run_id, answers, ask_id))
+        self.release.set()
+        return True
+
+    def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
+        line = json.dumps(
+            {
+                "type": "notify",
+                "seq": 1,
+                "kind": "ask",
+                "run_id": run_id,
+                "data": {
+                    "kind": "ask",
+                    "questions": [{"question": "color?"}],
+                    "ask_id": self.ask_id,
+                },
+            }
+        )
+        if on_line is not None:
+            on_line(line)
+        self.asked.set()
+        self.release.wait(5)
+        return ExecResult(exit_code=0, stdout=RESULT_OK, stderr="")
+
+
+class TestAskCorrelation:
+    """An answer must name the question it is for.
+
+    Without correlation the harness resolves whatever is pending, so a
+    reply sent for a question that has since timed out would silently
+    resolve the NEXT one -- answering something the user never saw.
+    """
+
+    def _start(self, controller: Controller, uid: str, cid: str) -> str:
+        db = get_session_factory()()
+        try:
+            return controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+
+    def test_the_ask_id_from_the_event_is_echoed_back(self, user_id) -> None:
+        uid, cid = user_id
+        runner = AskingRunner()
+        controller = _controller(runner)
+        run_id = self._start(controller, uid, cid)
+        assert runner.asked.wait(5)
+
+        assert controller.deliver_answer(run_id, ["blue"]) is True
+        assert runner.answers == [(run_id, ["blue"], "ask-7f3")]
+        _wait_status(controller, run_id, {"done"})
+
+    def test_a_caller_supplied_ask_id_wins(self, user_id) -> None:
+        """The client knows which question the user actually saw."""
+        uid, cid = user_id
+        runner = AskingRunner()
+        controller = _controller(runner)
+        run_id = self._start(controller, uid, cid)
+        assert runner.asked.wait(5)
+
+        controller.deliver_answer(run_id, ["blue"], ask_id="ask-from-client")
+        assert runner.answers == [(run_id, ["blue"], "ask-from-client")]
+        _wait_status(controller, run_id, {"done"})
+
+    def test_an_ask_without_an_id_leaves_the_answer_uncorrelated(self, user_id) -> None:
+        """Wire-compatible with a harness predating correlation."""
+        uid, cid = user_id
+        runner = AskingRunner(ask_id="")
+        controller = _controller(runner)
+        run_id = self._start(controller, uid, cid)
+        assert runner.asked.wait(5)
+
+        controller.deliver_answer(run_id, ["blue"])
+        assert runner.answers == [(run_id, ["blue"], None)]
+        _wait_status(controller, run_id, {"done"})
+
+
+@dataclass
+class MeteredRunner(StubRunner):
+    """Streams per-round usage snapshots, then waits to be cancelled."""
+
+    rounds: list = field(default_factory=lambda: [50, 150, 400])
+    cancelled_at: list = field(default_factory=list)
+    release: threading.Event = field(default_factory=threading.Event)
+
+    def cancel(self, sandbox_id: str, run_id: str) -> bool:
+        self.cancelled_at.append(run_id)
+        self.release.set()
+        return True
+
+    def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
+        for i, spent in enumerate(self.rounds, start=1):
+            if self.release.is_set():
+                break
+            if on_line is not None:
+                on_line(
+                    json.dumps(
+                        {
+                            "type": "notify",
+                            "seq": i,
+                            "kind": "usage",
+                            "run_id": run_id,
+                            "data": {"input": spent, "output": 0, "rounds": i},
+                        }
+                    )
+                )
+        self.release.wait(5)
+        return ExecResult(
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "seq": 99,
+                    "answer": "",
+                    "errors": [],
+                    "cancelled": True,
+                    "usage": {"input": 400, "output": 0, "rounds": 3},
+                }
+            )
+            + "\n",
+            stderr="",
+        )
+
+
+class TestMidRunBudget:
+    """Metering while the run is still spending.
+
+    Enforcement used to happen only before a run started, so a single
+    run could overshoot the allowance by any amount and the overspend
+    was only discovered from the ``result`` line -- after the tokens
+    had already been bought.
+    """
+
+    def _enable(self, monkeypatch: pytest.MonkeyPatch, free_tokens: int) -> None:
+        monkeypatch.setattr(get_settings(), "budget_enforce", True)
+        monkeypatch.setattr(get_settings(), "budget_free_tokens", free_tokens)
+
+    def test_run_is_cancelled_when_it_outruns_its_allowance(
+        self, user_id, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        uid, cid = user_id
+        self._enable(monkeypatch, free_tokens=200)
+        runner = MeteredRunner()
+        controller = _controller(runner)
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+        finally:
+            db.close()
+        _wait_status(controller, run.id, {"cancelled", "error"})
+
+        assert runner.cancelled_at == [run.id]  # cancelled exactly once
+        row = _run_row(run.id)
+        # the row says WHY, not just "cancelled" (indistinguishable from
+        # a user pressing stop)
+        assert row.error_code == "budget"
+        assert "token budget exceeded mid-run" in row.error
+
+    def test_a_run_inside_its_allowance_is_left_alone(
+        self, user_id, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        uid, cid = user_id
+        self._enable(monkeypatch, free_tokens=10_000)
+        runner = MeteredRunner()
+        controller = _controller(runner)
+        runner.release.set()  # nothing to wait for; finish promptly
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+        finally:
+            db.close()
+        _wait_status(controller, run.id, {"cancelled", "done", "error"})
+        assert runner.cancelled_at == []
+        assert _run_row(run.id).error_code != "budget"
+
+    def test_metering_is_off_when_enforcement_is_off(self, user_id) -> None:
+        """Default deployments must be untouched by this."""
+        uid, cid = user_id
+        assert get_settings().budget_enforce is False
+        runner = MeteredRunner()
+        controller = _controller(runner)
+        runner.release.set()
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+            with controller._lock:
+                assert controller._active[run.id].token_allowance is None
+        finally:
+            db.close()
+        _wait_status(controller, run.id, {"cancelled", "done", "error"})
+        assert runner.cancelled_at == []
+
+
+def _subscribe_and_collect(controller: Controller, run_id: str) -> list[dict]:
+    q = controller.subscribe(run_id)
+    assert q is not None
+    out: list[dict] = []
+    while True:
+        try:
+            event = q.get(timeout=5)
+        except Exception:  # noqa: BLE001 - queue.Empty
+            break
+        out.append(event)
+        if event.get("type") == "run":
+            break
+    return out
+
+
+@dataclass
+class ScriptRunner(StubRunner):
+    """Feeds exact lines through on_line, then returns a clean result."""
+
+    lines: list = field(default_factory=list)
+
+    def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
+        for line in self.lines:
+            if on_line is not None:
+                on_line(line.replace("__RID__", run_id))
+        return ExecResult(exit_code=0, stdout=RESULT_OK, stderr="")
+
+
+class TestLineGuards:
+    """Correlation and ordering guards on the inbound stream."""
+
+    def _run(self, controller: Controller, uid: str, cid: str) -> str:
+        db = get_session_factory()()
+        try:
+            return controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+
+    def test_a_line_for_another_run_is_dropped(self, user_id) -> None:
+        """The harness guards against cross-run contamination; a host
+        that never checks is trusting rather than verifying."""
+        uid, cid = user_id
+        runner = ScriptRunner(
+            lines=[
+                json.dumps({"type": "delta", "seq": 1, "run_id": "__RID__", "text": "mine"}),
+                json.dumps({"type": "delta", "seq": 2, "run_id": "run_someone_else", "text": "x"}),
+            ]
+        )
+        controller = _controller(runner)
+        run_id = self._run(controller, uid, cid)
+        _wait_status(controller, run_id, {"done"})
+        texts = [e["data"].get("text") for e in _run_row(run_id).events if e["type"] == "delta"]
+        assert texts == ["mine"]  # the foreign line never reached subscribers
+
+    def test_control_lines_are_consumed_not_relayed(self, user_id) -> None:
+        """A pong (or a respawn's ready) is not a run event; it used to
+        reach the browser as 'unknown event type'."""
+        uid, cid = user_id
+        runner = ScriptRunner(
+            lines=[
+                json.dumps({"type": "pong", "protocol": 1}),
+                json.dumps({"type": "ready", "protocol_version": 1}),
+                json.dumps({"type": "delta", "seq": 1, "run_id": "__RID__", "text": "hi"}),
+            ]
+        )
+        controller = _controller(runner)
+        run_id = self._run(controller, uid, cid)
+        _wait_status(controller, run_id, {"done"})
+        types = [e["type"] for e in _run_row(run_id).events]
+        assert "pong" not in types and "ready" not in types
+        assert "delta" in types
+        assert not any(e.get("malformed") for e in _run_row(run_id).events)
+
+    def test_a_seq_gap_is_counted_but_the_line_still_arrives(self, user_id) -> None:
+        """A gap means an EARLIER line was lost, not that this one is bad."""
+        uid, cid = user_id
+        runner = ScriptRunner(
+            lines=[
+                json.dumps({"type": "delta", "seq": 1, "run_id": "__RID__", "text": "a"}),
+                json.dumps({"type": "delta", "seq": 5, "run_id": "__RID__", "text": "b"}),
+            ]
+        )
+        controller = _controller(runner)
+        run_id = self._run(controller, uid, cid)
+        _wait_status(controller, run_id, {"done"})
+        # both arrived despite the gap (stored deltas are coalesced, so
+        # the two lines show up as one concatenated event)
+        texts = [e["data"].get("text") for e in _run_row(run_id).events if e["type"] == "delta"]
+        assert "".join(texts) == "ab"
+        assert "paw_protocol_seq_anomalies_total" in get_metrics().render()
+
+    def test_an_unknown_notify_kind_is_flagged_but_relayed(self, user_id) -> None:
+        uid, cid = user_id
+        runner = ScriptRunner(
+            lines=[
+                json.dumps(
+                    {
+                        "type": "notify",
+                        "seq": 1,
+                        "run_id": "__RID__",
+                        "kind": "quantum_entangle",
+                        "data": {"x": 1},
+                    }
+                )
+            ]
+        )
+        controller = _controller(runner)
+        run_id = self._run(controller, uid, cid)
+        _wait_status(controller, run_id, {"done"})
+        notifies = [e for e in _run_row(run_id).events if e["type"] == "notify"]
+        assert notifies and notifies[0].get("unknown_kind") is True
+
+    def test_an_oversize_payload_is_truncated_before_relay(
+        self, user_id, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Untrusted agent output must not reach the DOM unbounded."""
+        uid, cid = user_id
+        monkeypatch.setattr(get_settings(), "max_event_bytes", 500)
+        runner = ScriptRunner(
+            lines=[
+                json.dumps({"type": "log", "seq": 1, "run_id": "__RID__", "message": "B" * 20_000})
+            ]
+        )
+        controller = _controller(runner)
+        run_id = self._run(controller, uid, cid)
+        _wait_status(controller, run_id, {"done"})
+        logs = [e for e in _run_row(run_id).events if e["type"] == "log"]
+        assert logs and logs[0].get("truncated") is True
+        # `data` stays a mapping: the API schema validates it as an
+        # object, so collapsing it to a string would turn a huge event
+        # into a 500 on the run endpoint.
+        assert isinstance(logs[0]["data"], dict)
+        assert logs[0]["data"]["truncated"] is True
+        assert len(json.dumps(logs[0]["data"])) < 20_000
+
+
+class TestProtocolErrorDoesNotFailTheRun:
+    def test_a_rejected_answer_leaves_a_good_run_done(self, user_id) -> None:
+        """A stale/rejected answer is a timing problem, not an agent
+        failure; it used to mark the whole run as error."""
+        uid, cid = user_id
+        stdout = (
+            '{"type": "error", "error": {"code": "protocol", "message": "no pending question"},'
+            ' "message": "no pending question"}\n'
+            '{"type": "result", "seq": 2, "answer": "hello", "errors": [], '
+            '"usage": {"input": 1, "output": 1, "rounds": 1}}\n'
+        )
+        controller = _controller(StubRunner(stdout=stdout))
+        db = get_session_factory()()
+        try:
+            run = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi")
+        finally:
+            db.close()
+        _wait_status(controller, run.id, {"done"})
+        row = _run_row(run.id)
+        assert row.status == "done"  # the run succeeded
+        assert row.answer == "hello"
+        assert "no pending question" in row.error  # but it is still visible
+        assert row.error_code == "protocol"
+
+
+@dataclass
+class StreamThenBlockRunner(StubRunner):
+    """Emits numbered events, then holds the run open."""
+
+    emitted: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+
+    def exec_run(self, sandbox_id, prompt, run_id, on_line=None, timeout=None):
+        for n in (1, 2, 3):
+            if on_line is not None:
+                on_line(
+                    json.dumps({"type": "delta", "seq": n, "run_id": run_id, "text": f"chunk{n}"})
+                )
+        self.emitted.set()
+        self.release.wait(5)
+        return ExecResult(exit_code=0, stdout=RESULT_OK, stderr="")
+
+
+class TestLiveSubscriberResume:
+    """A reconnecting client must be able to resume a RUNNING run too.
+
+    The finished-run path replays from the stored transcript; this is
+    the in-memory one, which a reconnect mid-run goes through.
+    """
+
+    def test_subscribe_skips_already_seen_events(self, user_id) -> None:
+        uid, cid = user_id
+        runner = StreamThenBlockRunner()
+        controller = _controller(runner)
+        db = get_session_factory()()
+        try:
+            run_id = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+        assert runner.emitted.wait(5)
+        try:
+            fresh = controller.subscribe(run_id)
+            resumed = controller.subscribe(run_id, since_seq=2)
+            assert fresh is not None and resumed is not None
+            seqs_fresh = [fresh.get_nowait()["seq"] for _ in range(3)]
+            assert seqs_fresh == [1, 2, 3]
+            # the resumed client gets only what it had not seen
+            assert resumed.get_nowait()["seq"] == 3
+            assert resumed.empty()
+        finally:
+            runner.release.set()
+            _wait_status(controller, run_id, {"done"})
+
+    def test_a_resumed_live_subscriber_still_gets_the_terminal_event(self, user_id) -> None:
+        """It carries no seq, so a resume must never skip it."""
+        uid, cid = user_id
+        runner = StreamThenBlockRunner()
+        controller = _controller(runner)
+        db = get_session_factory()()
+        try:
+            run_id = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+        assert runner.emitted.wait(5)
+        resumed = controller.subscribe(run_id, since_seq=9999)
+        assert resumed is not None
+        assert resumed.empty()  # everything numbered was skipped
+        runner.release.set()
+        _wait_status(controller, run_id, {"done"})
+        terminal = resumed.get(timeout=5)
+        assert terminal == {"type": "run", "state": "done"}
+
+
+class TestSubscriberBackpressure:
+    """A slow client must not grow a queue without limit."""
+
+    def test_a_full_queue_drops_the_oldest_and_stays_current(
+        self, user_id, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        uid, cid = user_id
+        monkeypatch.setattr(get_settings(), "max_subscriber_queue", 5)
+        runner = StreamThenBlockRunner()
+        controller = _controller(runner)
+        db = get_session_factory()()
+        try:
+            run_id = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+        assert runner.emitted.wait(5)
+        try:
+            q = controller.subscribe(run_id)
+            assert q is not None
+            # a client that never reads: push well past the bound
+            for n in range(50):
+                controller._broadcast(run_id, {"type": "delta", "seq": 100 + n, "data": {}})
+            assert q.qsize() <= 5  # bounded
+            # and what it holds is the NEWEST, so a live view stays current
+            seqs = []
+            while not q.empty():
+                seqs.append(q.get_nowait().get("seq"))
+            assert seqs[-1] == 149
+            assert "paw_sse_events_dropped_total" in get_metrics().render()
+        finally:
+            runner.release.set()
+            _wait_status(controller, run_id, {"done"})
+
+    def test_the_terminal_event_lands_even_on_a_full_queue(
+        self, user_id, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dropping it would leave the client waiting forever on a run
+        that is already over."""
+        uid, cid = user_id
+        monkeypatch.setattr(get_settings(), "max_subscriber_queue", 3)
+        runner = StreamThenBlockRunner()
+        controller = _controller(runner)
+        db = get_session_factory()()
+        try:
+            run_id = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+        assert runner.emitted.wait(5)
+        q = controller.subscribe(run_id)
+        assert q is not None
+        for n in range(20):
+            controller._broadcast(run_id, {"type": "delta", "seq": 200 + n, "data": {}})
+        runner.release.set()
+        _wait_status(controller, run_id, {"done"})
+
+        drained = []
+        while not q.empty():
+            drained.append(q.get_nowait())
+        assert drained[-1] == {"type": "run", "state": "done"}
+
+
+class TestStoredTranscriptBounded:
+    def test_deltas_are_coalesced_in_storage(self, user_id) -> None:
+        """One row per token is what made the stored JSON grow without
+        bound; concatenation is lossless for rendering."""
+        uid, cid = user_id
+        lines = [
+            json.dumps({"type": "delta", "seq": n, "run_id": "__RID__", "text": f"t{n}"})
+            for n in range(1, 31)
+        ]
+        controller = _controller(ScriptRunner(lines=lines))
+        db = get_session_factory()()
+        try:
+            run_id = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+        _wait_status(controller, run_id, {"done"})
+        events = _run_row(run_id).events
+        deltas = [e for e in events if e["type"] == "delta"]
+        assert len(deltas) == 1  # 30 lines -> 1 stored event
+        assert deltas[0]["data"]["text"] == "".join(f"t{n}" for n in range(1, 31))
+
+    def test_a_pathological_transcript_is_capped_with_a_marker(
+        self, user_id, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        uid, cid = user_id
+        monkeypatch.setattr(get_settings(), "max_stored_events", 9)
+        lines = [
+            json.dumps(
+                {"type": "notify", "seq": n, "run_id": "__RID__", "kind": "tool", "data": {"n": n}}
+            )
+            for n in range(1, 41)
+        ]
+        controller = _controller(ScriptRunner(lines=lines))
+        db = get_session_factory()()
+        try:
+            run_id = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+        _wait_status(controller, run_id, {"done"})
+        events = _run_row(run_id).events
+        assert len(events) <= 9
+        assert any(e.get("elided") for e in events)  # honest about the gap
+
+    def test_coalescing_does_not_corrupt_the_live_buffer(self, user_id) -> None:
+        """The stored copy is built from the same dicts the fan-out
+        buffer holds, so an in-place merge would rewrite what live
+        subscribers were already shown."""
+        uid, cid = user_id
+        lines = [
+            json.dumps({"type": "delta", "seq": n, "run_id": "__RID__", "text": f"t{n}"})
+            for n in (1, 2, 3)
+        ]
+        controller = _controller(ScriptRunner(lines=lines))
+        db = get_session_factory()()
+        try:
+            run_id = controller.start_run(db, user_id=uid, conversation_id=cid, prompt="hi").id
+        finally:
+            db.close()
+        seen = _subscribe_and_collect(controller, run_id)
+        texts = [e["data"]["text"] for e in seen if e["type"] == "delta"]
+        assert texts == ["t1", "t2", "t3"]  # each delivered separately

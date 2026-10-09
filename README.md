@@ -74,8 +74,9 @@ That separation is the whole point:
 │                 secrets · usage  (rules, persistence, refusals)      │
 │    machinery    manager.py  run lifecycle, event fan-out (subscribe) │
 │                 protocol.py JSONL line parsing                       │
-│                 runner.py   ServerRunner: one resident harness       │
-│                             process per conversation                 │
+│                 runner.py   ResidentRunner: the whole sandbox        │
+│                             lifecycle, once; Server/Docker supply    │
+│                             only a SandboxTransport                  │
 │  infra/         config (PAW_* env) · db (engine + migrations) ·      │
 │                 security (JWT, Fernet)                               │
 │  models/        ORM entities: users, conversations, runs,            │
@@ -104,6 +105,12 @@ That separation is the whole point:
 |---|---|---|
 | Backend ↔ harness | JSON-lines over stdin/stdout pipes | ops down, events up |
 | Browser ↔ backend | Server-Sent Events (SSE) | events streamed to the UI |
+
+Each SSE frame carries the harness `seq` as its event id, so a
+reconnecting client sends `Last-Event-ID` (or `?last_event_id=`) and
+resumes from there instead of replaying the run. Lifecycle events have
+no `seq` and are always delivered, so a resume can never skip the
+terminal event and leave a client hanging.
 
 The controller is a **protocol translator**: it parses each JSONL line
 from the harness, fans it out to in-memory subscribers, and re-emits it
@@ -166,8 +173,10 @@ the harness answers with events.
 
 ```
 host → harness: {"op": "submit", "prompt": ..., "run_id": ...}
-                {"op": "answer", "run_id": ..., "answers": [...]}
+                {"op": "answer", "run_id": ..., "answers": [...], "ask_id": ...}
                 {"op": "cancel", "run_id": ...} / {"op": "ping"} / {"op": "shutdown"}
+                {"op": "hello", "protocol_versions": [...]}
+                ... each op carries an "op_id", echoed on what it causes
 
 harness → host: {"type": "ready"}                 (once, on startup)
                 start / delta / notify / log       (per run, streamed)
@@ -197,7 +206,41 @@ Because the process is **resident** (survives between turns):
 
 `tool_calls` is additive: a harness that doesn't emit it degrades
 gracefully to the bare names from `tool_start`. `log` lines are shown
-too, except internal session bookkeeping (the generated title).
+too, except internal session bookkeeping (the generated title). A
+`kind` this build does not know is still relayed, flagged
+`unknown_kind` so a client can decline to render it.
+
+### What the driver validates
+
+The protocol's own guarantees are checked rather than assumed:
+
+| field | check |
+|---|---|
+| `protocol_version` (on `ready`) | refused unless supported — loudly, once per run, instead of misparsing every line |
+| `capabilities` (on `ready`) | recorded and logged; features degrade gracefully, so nothing is gated on them |
+| `run_id` | a line labelled with another run is dropped, not fanned out under this one |
+| `seq` | monotonicity checked per run; gaps and reorders counted (`paw_protocol_seq_anomalies_total`) |
+| `errors[].code` | kept beside the text and persisted as `run.error_code`, so callers branch on a code, not on prose |
+| `op_id` (on `error`) | echoed back by the harness, so a refusal names the op it refused instead of arriving unattributed |
+| `notify` payloads | size-capped before relay (`PAW_MAX_EVENT_BYTES`), type-preserving |
+
+A protocol `error` line (a rejected `answer`, a stale `ask_id`) is kept
+in its own trail: it stays visible, but it does not by itself mark an
+otherwise successful run as failed.
+
+Negotiation runs both ways: `ready` tells the host what the harness
+speaks, and `hello` tells the harness what the host can parse, so a
+version mismatch is settled before any run. Both are sent only to a
+build advertising the matching capability (`hello`, `op_id`) — an older
+harness answers an unknown op with an `error` line, so the host does
+not speak features the sandbox never claimed.
+
+A warm sandbox is probed with `ping` before reuse
+(`PAW_SANDBOX__PROBE_TIMEOUT`). A resident process that is alive but no
+longer reading its stdin is invisible to an exit-status check, and
+submitting to it would hang for the host timeout; the probe turns that
+into a respawn. Teardown sends `shutdown` before closing stdin, so an
+active run can still emit its terminal `result`.
 
 ---
 
@@ -362,6 +405,7 @@ groups use a double underscore (e.g. `PAW_HARNESS__CMD`).
 | `PAW_RUNNER` | `server` | `server` (host subprocess) or `docker` (isolated container) |
 | `PAW_SANDBOX__TTL_SECONDS` | `300` | idle sandbox reaper TTL (never applied to a sandbox with a live run) |
 | `PAW_SANDBOX__REAP_INTERVAL_SECONDS` | `60` | how often the background reaper sweeps; `0` disables it |
+| `PAW_SANDBOX__PROBE_TIMEOUT` | `5` | liveness `ping` before reusing a warm sandbox; `0` disables it |
 
 The three budget vars are spawn-time arguments to `harness serve`, not
 fields on the submit op: the harness refuses to take a budget off the
@@ -409,6 +453,11 @@ command line entirely when unset, so the default is an unbounded run.
 |---|---|---|
 | `PAW_SHUTDOWN_DRAIN_SECONDS` | `25` | on SIGTERM, seconds to let in-flight runs finish before exit |
 | `PAW_CANCEL_GRACE_SECONDS` | `10` | after a *user* cancels, how long to wait for the harness to honour it before destroying the sandbox; `0` disables escalation |
+| `PAW_MAX_EVENT_BYTES` | `65536` | per-event cap on relayed harness payloads; `0` disables it |
+| `PAW_MAX_LINE_BYTES` | `4194304` | longest single JSONL line accepted from a sandbox; oversize lines are discarded whole |
+| `PAW_MAX_RUN_STDOUT_BYTES` | `8388608` | cap on the raw transcript an exec keeps in memory; past it only outcome-bearing lines are retained |
+| `PAW_MAX_STORED_EVENTS` | `2000` | cap on events persisted with a finished run (deltas are merged first) |
+| `PAW_MAX_SUBSCRIBER_QUEUE` | `1000` | per-SSE-subscriber queue depth; when full the oldest event is dropped |
 | `PAW_INSTANCE_ID` | host+pid | this instance's id (set to pod/task name); scopes run reconciliation |
 
 `PAW_CANCEL_GRACE_SECONDS` is a recovery path, not a run budget: it is
@@ -419,6 +468,24 @@ the partial unique index locks that conversation out of new runs.
 Escalation closes the sandbox so the run's own worker can finalize it.
 
 ---
+
+### Bounded by construction
+
+Everything the sandbox emits is untrusted input, so each hop has a
+ceiling rather than growing with whatever the agent decides to print:
+
+| hop | bound |
+|---|---|
+| one line off the pipe | `PAW_MAX_LINE_BYTES` — an oversize line is drained to its newline and dropped, so its tail is never reparsed as fresh lines |
+| one relayed event | `PAW_MAX_EVENT_BYTES` — oversize bodies are replaced, type-preserving, envelope untouched |
+| the exec's in-memory transcript | `PAW_MAX_RUN_STDOUT_BYTES` — past it only `result`/`error`/error-and-usage `notify` lines are kept, so the verdict and token counts can never be dropped |
+| a subscriber's backlog | `PAW_MAX_SUBSCRIBER_QUEUE` — oldest-first drop keeps a live view current; the `id:` gap tells the client to resume. The terminal event is never dropped |
+| the stored transcript | `PAW_MAX_STORED_EVENTS` — consecutive deltas are merged (lossless for rendering), then the middle is elided with a marker |
+
+Deltas are token-sized, and the transcript used to keep one row per
+token in a JSON column, so a long answer grew the row without bound.
+Merging them is lossless because any client renders deltas by
+concatenation.
 
 ## Design principles
 
@@ -441,6 +508,23 @@ and imports nothing but `infra`. Anything that takes a `Session`, reads
 or writes an ORM entity, or can refuse a request lives in `controllers`.
 Keeping that direction means the bottom layer never imports `models` or
 `controllers.errors`.
+
+**One resident lifecycle, two transports.** `ServerRunner` and
+`DockerRunner` differ only in what hosts the harness: a host
+subprocess or a container. That difference is confined to
+`SandboxTransport` (spawn, read a line, write a line, check alive,
+interrupt a blocked read, tear down). The registry and its locking,
+the ready handshake, version negotiation, liveness probing, the idle
+reaper, cancel/answer, the exec lifecycle and the event pump live once
+in `ResidentRunner`.
+
+They used to live twice, and the two copies drifted five separate
+times — `destroy` skipping teardown in one of them, a respawn
+re-registering onto a swept sandbox, `hello` never sent, a warm
+sandbox never probed, and two different answers for a create-time
+spawn failure. Every one was found by reading the pair side by side
+rather than by a test. Sharing the logic is what makes that class of
+bug unrepresentable.
 
 **The harness is decoupled.** It is a black-box binary driven only by
 its JSONL protocol (`seq` for ordering, `run_id` for correlation,

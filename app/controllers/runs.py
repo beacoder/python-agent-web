@@ -89,20 +89,31 @@ def cancel(controller: Controller, run_id: str) -> bool:
     return controller.cancel_run(run_id)
 
 
-def answer(controller: Controller, run_id: str, answers: list[str]) -> None:
+def answer(
+    controller: Controller, run_id: str, answers: list[str], ask_id: str | None = None
+) -> None:
     """Forward a reply to a pending mid-run question.
 
-    The harness's ask event (notify kind ``ask``) carries the questions;
-    the reply goes to the blocked agent verbatim.
+    The harness's ask event (notify kind ``ask``) carries the questions
+    and an ``ask_id``; the reply goes to the blocked agent verbatim,
+    tagged with the id so it cannot resolve a different question.
     """
-    if not controller.deliver_answer(run_id, answers):
+    if not controller.deliver_answer(run_id, answers, ask_id):
         raise Conflict("run is not accepting answers (finished, or runner lacks mid-run Q&A)")
 
 
-def replay_payloads(run: Run) -> list[dict[str, Any]]:
+def replay_payloads(run: Run, since_seq: int = 0) -> list[dict[str, Any]]:
     """Stored transcript of a finished run, terminal event included.
 
     A late subscriber gets the same event sequence a live one saw, so
     the browser renders a finished run exactly like it watched it.
+    ``since_seq`` skips what a reconnecting client already has; the
+    terminal event has no ``seq`` and is always included, so a resume
+    can never leave the client hanging on a finished run.
     """
-    return [*(run.events or []), {"type": "run", "state": run.status}]
+    stored = [
+        e
+        for e in (run.events or [])
+        if not (since_seq > 0 and isinstance(e.get("seq"), int) and e["seq"] <= since_seq)
+    ]
+    return [*stored, {"type": "run", "state": run.status}]
