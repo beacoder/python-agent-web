@@ -277,6 +277,55 @@ class TestHandshake:
         assert hs.capabilities == frozenset()
         assert hs.pid is None
 
+    def test_a_numeric_string_version_is_read(self) -> None:
+        assert parse_ready({"type": "ready", "protocol_version": " 1 "}).protocol_version == 1
+
+    def test_a_boolean_is_not_read_as_a_version(self) -> None:
+        """bool is an int subclass, so without the guard ``False`` would
+        be read as version 0 and the sandbox refused outright.
+
+        Tested with False rather than True on purpose: ``int(True)`` is
+        1, which is also the assumed version, so True cannot distinguish
+        the two behaviours.
+        """
+        hs = parse_ready({"type": "ready", "protocol_version": False})
+        assert hs.protocol_version == ASSUMED_PROTOCOL_VERSION
+        assert hs.supported is True
+
+    def test_a_boolean_pid_is_rejected(self) -> None:
+        assert parse_ready({"type": "ready", "pid": True}).pid is None
+
+    def test_non_finite_versions_degrade_instead_of_raising(self) -> None:
+        """``json`` accepts Infinity/NaN by default and ``int()`` refuses
+        them, so an untrusted sandbox could crash this parse -- which
+        surfaced as an opaque "runner error" on the run rather than a
+        version problem."""
+        import json as _json
+
+        for literal in ("Infinity", "-Infinity", "NaN", "1e400"):
+            payload = _json.loads(f'{{"type":"ready","protocol_version":{literal}}}')
+            hs = parse_ready(payload)
+            assert hs.protocol_version == ASSUMED_PROTOCOL_VERSION, literal
+            assert hs.supported is True, literal
+
+    def test_an_integral_float_version_is_accepted(self) -> None:
+        assert parse_ready({"type": "ready", "protocol_version": 1.0}).protocol_version == 1
+
+    def test_a_fractional_float_is_not_truncated(self) -> None:
+        """Truncating 1.9 to 1 would silently claim support."""
+        hs = parse_ready({"type": "ready", "protocol_version": 1.9})
+        assert hs.protocol_version == ASSUMED_PROTOCOL_VERSION
+
+    def test_a_structured_version_degrades(self) -> None:
+        hs = parse_ready({"type": "ready", "protocol_version": {"nested": 1}})
+        assert hs.protocol_version == ASSUMED_PROTOCOL_VERSION
+
+    def test_an_unsupported_numeric_string_is_still_refused(self) -> None:
+        """Narrowing must not turn a real mismatch into a fallback."""
+        hs = parse_ready({"type": "ready", "protocol_version": "99"})
+        assert hs.protocol_version == 99
+        assert hs.supported is False
+
     def test_protocol_field_is_accepted_as_the_version(self) -> None:
         hs = parse_ready({"type": "ready", "protocol": 1})
         assert hs.protocol_version == 1

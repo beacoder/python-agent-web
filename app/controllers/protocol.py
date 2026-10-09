@@ -81,15 +81,42 @@ def parse_ready(payload: dict[str, Any]) -> Handshake:
     being treated as unsupported.
     """
     raw_version = payload.get("protocol_version", payload.get("protocol"))
-    try:
-        version = int(raw_version)
-    except (TypeError, ValueError):
-        version = ASSUMED_PROTOCOL_VERSION
+    version = _as_version(raw_version)
     raw_caps = payload.get("capabilities")
     caps = frozenset(str(c) for c in raw_caps) if isinstance(raw_caps, list) else frozenset()
     raw_pid = payload.get("pid")
-    pid = raw_pid if isinstance(raw_pid, int) else None
+    pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
     return Handshake(protocol_version=version, capabilities=caps, pid=pid)
+
+
+def _as_version(raw: Any) -> int:
+    """A wire value read as a protocol version, else the assumed one.
+
+    Narrows before converting rather than letting ``int()`` raise on
+    whatever arrived: the ``ready`` line is untrusted input, so the
+    shapes accepted belong in the code instead of in an
+    ``except TypeError``.
+
+    ``bool`` is excluded because it would otherwise be read as a
+    version (``False`` as 0, which no build supports).  Non-integral
+    floats are excluded rather than truncated -- and that also covers
+    ``Infinity``/``NaN``, which Python's ``json`` accepts by default
+    and which ``int()`` refuses with ``OverflowError``/``ValueError``:
+    a sandbox could otherwise crash this parse instead of degrading.
+    """
+    if isinstance(raw, bool):
+        return ASSUMED_PROTOCOL_VERSION
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        # is_integer() is False for inf and nan as well as for 1.9
+        return int(raw) if raw.is_integer() else ASSUMED_PROTOCOL_VERSION
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return ASSUMED_PROTOCOL_VERSION
+    return ASSUMED_PROTOCOL_VERSION
 
 
 @dataclass

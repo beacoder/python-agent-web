@@ -178,16 +178,16 @@ class SandboxTransport:
         """
         return 0
 
-    # -- test/diagnostic accessors -------------------------------------
-    proc: subprocess.Popen | None = None
-    container: Any = None
-    stream: Any = None
-
 
 class _ProcessTransport(SandboxTransport):
     """A host subprocess speaking the protocol over pipes."""
 
     label = "process"
+
+    proc: subprocess.Popen
+    """The live process.  Declared concretely here rather than as an
+    Optional on the base: doing it there erased the type for every
+    method in this class."""
 
     def __init__(self, proc: subprocess.Popen) -> None:
         self.proc = proc
@@ -265,6 +265,9 @@ class _ContainerTransport(SandboxTransport):
     """A container speaking the protocol over its attach socket."""
 
     label = "container"
+
+    container: Any
+    stream: _DockerStream
 
     def __init__(self, container: Any, stream: _DockerStream) -> None:
         self.container = container
@@ -1209,7 +1212,11 @@ class ServerRunner(ResidentRunner):
     def _procs(self) -> dict[str, subprocess.Popen]:
         """Live processes by sandbox id (diagnostics and tests)."""
         with self._lock:
-            return {sid: t.proc for sid, t in self._transports.items() if t.proc is not None}
+            return {
+                sid: t.proc
+                for sid, t in self._transports.items()
+                if isinstance(t, _ProcessTransport)
+            }
 
 
 # -- container runner ------------------------------------------------------
@@ -1446,13 +1453,19 @@ class DockerRunner(ResidentRunner):
     def _containers(self) -> dict[str, Any]:
         with self._lock:
             return {
-                sid: t.container for sid, t in self._transports.items() if t.container is not None
+                sid: t.container
+                for sid, t in self._transports.items()
+                if isinstance(t, _ContainerTransport)
             }
 
     @property
-    def _streams(self) -> dict[str, Any]:
+    def _streams(self) -> dict[str, _DockerStream]:
         with self._lock:
-            return {sid: t.stream for sid, t in self._transports.items() if t.stream is not None}
+            return {
+                sid: t.stream
+                for sid, t in self._transports.items()
+                if isinstance(t, _ContainerTransport)
+            }
 
 
 def _container_exit_code(container: Any) -> int | None:
